@@ -33,11 +33,15 @@ macro_rules! once {
 /// A texture's upload state: the staging buffer laid out as the host
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
-    buffer: ID3D12Resource,
+    /// The staging buffer and its mapping. (Neptune) Made with the staging state, unless the
+    /// texture is detiled on the card (`crate::detile`): then only when an upload has to go
+    /// the CPU's way after all, and from then on for as long as the staging state lives (a
+    /// list that recorded a copy from it holds the state, so the buffer is never let go under
+    /// a list, and the detile always has it to write into).
+    cpu: std::sync::OnceLock<(ID3D12Resource, usize)>,
     /// Its bytes.
     #[cfg(feature = "diagnostics")]
     total: u64,
-    data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
@@ -407,6 +411,10 @@ static STAGED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::A
 impl Drop for Staging {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
+        // (Neptune) Detiled on the card and never sent the CPU's way: no buffer to count.
+        let Some((buffer, data)) = self.cpu.take() else {
+            return;
+        };
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
         // (Neptune) Its upload buffer is kept for the next staging buffer of its size class.
@@ -420,7 +428,7 @@ impl Drop for Staging {
                 if pool.free.len() <= class {
                     pool.free.resize_with(class + 1, Vec::new);
                 }
-                pool.free[class].push((self.buffer.clone(), self.data as usize));
+                pool.free[class].push((buffer, data));
                 pool.bytes += size;
             }
         }
@@ -512,7 +520,7 @@ pub(crate) fn memory() -> [u64; 3] {
 /// For the resident line: the mapped staging buffers, as (address, length) each.
 pub(crate) fn cpu_ranges() -> Vec<(usize, usize)> {
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    map.iter().flat_map(|m| m.values()).filter(|s| !s.data.is_null()).map(|s| (s.data as usize, s.bytes as usize)).collect()
+    map.iter().flat_map(|m| m.values()).filter_map(|s| s.cpu.get().map(|&(_, data)| (data, s.bytes as usize))).collect()
 }
 
 /// Staging buffers let go as idle since the start, and their bytes.
@@ -551,10 +559,12 @@ pub(crate) fn let_go_idle() {
         let keep = Arc::strong_count(s) > 1
             || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
         if !keep {
+            // (Neptune) Detiled on the card: no buffer let go with it.
+            let held = if s.cpu.get().is_some() { s.bytes } else { 0 };
             LET_GO[0].fetch_add(1, Relaxed);
-            LET_GO[1].fetch_add(s.bytes, Relaxed);
+            LET_GO[1].fetch_add(held, Relaxed);
             went += 1;
-            bytes += s.bytes;
+            bytes += held;
         }
         keep
     });
@@ -731,6 +741,26 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
         list.defer_texture(staging);
         return;
     }
+    // (Neptune) Detiled on the card (`crate::detile`): the copies read a slice of its ring,
+    // filled and detiled at this list's submission. What cannot go there now (a ring full,
+    // no table) goes the CPU's way at once, with a staging buffer of its own from now on.
+    let routed = route(
+        &staging,
+        || crate::detile::reserve(&staging.layout, &staging.subs(), staging.size as u64, staging.bytes),
+        |bytes| host().and_then(|host| stage_buffer(host, bytes)),
+    );
+    let staging_buffer = match routed {
+        Route::Card(upload) => {
+            upload_on_card(list, resource, texture, staging, upload);
+            return;
+        }
+        // No memory for a staging buffer either: no upload recorded; the next list asks again.
+        Route::Nothing => return,
+        Route::Cpu => match staging.cpu.get() {
+            Some((buffer, _)) => buffer,
+            None => return,
+        },
+    };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
     const COPY_DEST: u32 = 0x400;
@@ -742,7 +772,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
         {
             let f = footprint.Footprint;
             // SAFETY: live resources.
-            let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
+            let (gpu, d) = unsafe { (staging_buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
             let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
             list.note_read(
                 || {
@@ -775,7 +805,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
         };
         let from = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: as above.
-            pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
+            pResource: unsafe { std::mem::transmute_copy(staging_buffer) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                 PlacedFootprint: *footprint,
@@ -1259,20 +1289,13 @@ impl Staging {
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-        // Levels on demand: which levels are the title's is judged here,
-        // once, for what the staging buffer holds from now on. The step
-        // that gives levels their memory goes by this answer.
-        let held = if self.on_demand {
-            use std::sync::atomic::Ordering::Relaxed;
-            let judged = self.judgement();
-            self.judged[0].store(judged[0], Relaxed);
-            self.judged[1].store(judged[1], Relaxed);
-            let held = self.held_levels(judged);
-            self.detiled.store(held, Relaxed);
-            held
-        } else {
-            u32::MAX
+        let held = self.judge_levels();
+        // (Neptune) Detiled on the card and no staging buffer: what changed is noted (dirty,
+        // the levels judged), and the next list that samples the texture uploads it.
+        let Some(&(_, data)) = self.cpu.get() else {
+            return;
         };
+        let data = data as *mut u8;
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -1288,7 +1311,7 @@ impl Staging {
             let len = pitch * rows as usize * f.Depth as usize;
             // SAFETY: the subresource's part of the mapped staging buffer.
             let linear = unsafe {
-                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
+                std::slice::from_raw_parts_mut(data.add(footprint.Offset as usize), len)
             };
             if mip < 32 && held & (1 << mip) == 0 {
                 // Not the title's: zeros, not what lies in that memory.
@@ -1303,6 +1326,222 @@ impl Staging {
                 return;
             }
         }
+    }
+
+    /// Levels on demand: which levels are the title's is judged here, once, for what the
+    /// staging buffer (or the card's detile) holds from now on. The step that gives levels
+    /// their memory goes by this answer. `u32::MAX` (all) for other textures.
+    fn judge_levels(&self) -> u32 {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.on_demand {
+            return u32::MAX;
+        }
+        let judged = self.judgement();
+        self.judged[0].store(judged[0], Relaxed);
+        self.judged[1].store(judged[1], Relaxed);
+        let held = self.held_levels(judged);
+        self.detiled.store(held, Relaxed);
+        held
+    }
+
+    /// (Neptune) The staging buffer of a texture detiled on the card, made now for an upload
+    /// that goes the CPU's way (`crate::detile` had no room, or no table for it): kept from
+    /// now on, as without the switch. What it holds is nothing yet, so the next refresh
+    /// detiles whatever the memory says. Whether there is one.
+    fn ensure_cpu(&self, make: impl FnOnce(u64) -> Option<(ID3D12Resource, *mut u8)>) -> bool {
+        if self.cpu.get().is_some() {
+            return true;
+        }
+        let Some(made) = make(self.bytes) else {
+            return false;
+        };
+        let memory = self.memory as usize;
+        crate::host::name(&made.0, || format!("staging of {memory:#x} (detiled on the CPU after all)"));
+        // Another thread may have made one first: then this one is let go, and theirs is it.
+        if self.cpu.set((made.0, made.1 as usize)).is_ok() {
+            use std::sync::atomic::Ordering::Relaxed;
+            STAGED[0].fetch_add(1, Relaxed);
+            STAGED[1].fetch_add(self.bytes, Relaxed);
+            self.forget();
+            self.dirty.store(true, Relaxed);
+        }
+        true
+    }
+
+    /// (Neptune) The subresources of the staging layout, for `crate::detile::reserve`.
+    fn subs(&self) -> Vec<crate::detile::Sub> {
+        self.footprints
+            .iter()
+            .zip(&self.rows)
+            .enumerate()
+            .map(|(i, (f, &rows))| {
+                let (mip, slice) = self.part(i);
+                crate::detile::Sub {
+                    mip,
+                    slice,
+                    offset: f.Offset,
+                    row_pitch: u64::from(f.Footprint.RowPitch),
+                    rows,
+                    depth: f.Footprint.Depth,
+                }
+            })
+            .collect()
+    }
+
+    /// (Neptune) At submission, for an upload detiled on the card: title memory as it is now
+    /// goes into the upload's slice and its detile into the submission's first list, whether
+    /// or not it changed since the last check (the list's copy reads this slice). Read as a
+    /// refresh reads it (through the copy, which stands unmapped pages as zeros), and noted
+    /// as a refresh notes it, so that the next check of the texture finds it as filled now.
+    /// A list submitted again while its last submission may still read the slice leaves it.
+    pub(crate) fn gpu_fill(&self, upload: &Arc<crate::detile::Upload>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if upload.in_flight() {
+            crate::detile::reuse(upload);
+            return;
+        }
+        let started = std::time::Instant::now();
+        let (start, size) = (self.memory as usize, self.size);
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        let asked = crate::watch::writes(start, start + size, false).or_else(|| crate::watch::writes(start, start + size, true));
+        if let Some((now, _)) = asked {
+            last.asked = now;
+        }
+        with_read(size, |read| {
+            crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+            last.hash = Some(blake3::hash(read));
+            let held = self.judge_levels();
+            let expected = if crate::detile::check_due() { self.expected(read, held) } else { None };
+            crate::detile::fill(upload, &read[..(upload.raw_len() as usize).min(size)], held, expected);
+        });
+        drop(last);
+        let preparing = &crate::host::PREPARING;
+        preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+        preparing[3].fetch_add(size as u64, Relaxed);
+    }
+
+    /// (Neptune) What the card's detile of `read` must give (`VICTORY_GPU_DETILE_VERIFY`):
+    /// the CPU's detile into a buffer laid out as the staging buffer, with the ranges that
+    /// are the texture's (rows without their padding; the whole part for levels not held,
+    /// which are zeros). `None` if the CPU cannot detile it.
+    fn expected(&self, read: &[u8], held: u32) -> Option<crate::detile::Expected> {
+        let mut bytes = vec![0u8; self.bytes as usize];
+        let mut ranges = Vec::new();
+        let n = u64::from(self.layout.desc.element_bytes);
+        for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
+            let (mip, slice) = self.part(i);
+            let f = footprint.Footprint;
+            let pitch = f.RowPitch as usize;
+            let at = footprint.Offset as usize;
+            // The last subresource's last row ends at its bytes, not at a whole pitch.
+            let len = (pitch * rows as usize * f.Depth as usize).min(bytes.len().saturating_sub(at));
+            if mip < 32 && held & (1 << mip) == 0 {
+                ranges.push((at as u64, len as u64));
+                continue;
+            }
+            self.layout.detile(read, mip, slice, bytes.get_mut(at..at + len)?, pitch, pitch * rows as usize).ok()?;
+            let m = self.layout.mips.get(mip as usize)?;
+            for z in 0..u64::from(m.depth) {
+                for y in 0..u64::from(m.height) {
+                    ranges.push((at as u64 + z * (pitch as u64 * u64::from(rows)) + y * pitch as u64, u64::from(m.width) * n));
+                }
+            }
+        }
+        Some(crate::detile::Expected {
+            bytes,
+            ranges,
+            what: format!("{:?} at {:#x}", self.layout.desc, self.memory as usize),
+        })
+    }
+}
+
+#[cfg(test)]
+#[path = "texture_detile_tests.rs"]
+mod detile_fallback_tests;
+
+/// (Neptune) Which way a recorded upload goes.
+enum Route {
+    /// Detiled on the card, from these slices.
+    Card(Arc<crate::detile::Upload>),
+    /// The CPU's way: the staging buffer is there.
+    Cpu,
+    /// Neither could be had now.
+    Nothing,
+}
+
+/// (Neptune) The way of an upload of `staging` about to be recorded: a staging state with a
+/// staging buffer keeps it (the CPU's way, as without `crate::detile`); one without asks
+/// `reserve` for the card's slices, and on any refusal (a ring full, no table, the rings not
+/// made) has `make` make its staging buffer at once and goes the CPU's way from now on. Never
+/// waits.
+fn route(
+    staging: &Staging,
+    reserve: impl FnOnce() -> Result<Arc<crate::detile::Upload>, crate::detile::Why>,
+    make: impl FnOnce(u64) -> Option<(ID3D12Resource, *mut u8)>,
+) -> Route {
+    if staging.cpu.get().is_some() {
+        return Route::Cpu;
+    }
+    match reserve() {
+        Ok(upload) => Route::Card(upload),
+        Err(why) => {
+            crate::detile::refused(why);
+            if staging.ensure_cpu(make) { Route::Cpu } else { Route::Nothing }
+        }
+    }
+}
+
+/// (Neptune) Records `staging`'s upload from `upload`'s slice of the card's detile ring
+/// (`crate::detile`): the copies here, the fill and detile at the list's submission.
+fn upload_on_card(list: &HostList, resource: This, texture: &ID3D12Resource, staging: Arc<Staging>, upload: Arc<crate::detile::Upload>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(out) = crate::detile::out_buffer() else {
+        return;
+    };
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::TexUploads, 1);
+    const COPY_DEST: u32 = 0x400;
+    crate::list::ensure_state(list, resource, COPY_DEST);
+    for (i, footprint) in staging.footprints.iter().enumerate() {
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: staging.subresource(i),
+            },
+        };
+        let mut placed = *footprint;
+        placed.Offset += upload.out_offset();
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above; the ring lives for the run.
+            pResource: unsafe { std::mem::transmute_copy(&out) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: placed },
+        };
+        // SAFETY: an open list; both locations name live resources.
+        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+    }
+    // As the CPU's upload: current from this list's submission on. The fill below does not
+    // say dirty (it is the upload); a later check that finds the memory changed does.
+    {
+        let staging = staging.clone();
+        list.defer_host(move || {
+            staging.uploaded.store(true, Relaxed);
+            staging.dirty.store(false, Relaxed);
+        });
+    }
+    list.defer_gpu_texture(staging.clone(), upload);
+    // Levels on demand: as the CPU's upload, after the fill judged the levels.
+    let on_demand = if staging.on_demand { crate::resource::host_tiled(resource) } else { None };
+    if let Some(on_demand) = on_demand {
+        list.defer_host(move || {
+            let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64);
+            staging.waiting.store(if waiting { crate::host::moment().max(1) } else { 0 }, Relaxed);
+            if waiting {
+                crate::descriptor::host::levels_waiting(staging.memory as u64);
+            }
+        });
     }
 }
 
@@ -1643,21 +1882,26 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
             Some(&mut total),
         );
     }
-    let (buffer, data) = stage_buffer(host, total)?;
-    crate::host::name(&buffer, || {
-        format!(
-            "staging of {resource:?} {}x{}x{} f{}",
-            d.Width, d.Height, d.DepthOrArraySize, d.Format.0
-        )
-    });
+    // (Neptune) Detiled on the card (`crate::detile`): no staging buffer unless an upload has
+    // to go the CPU's way. Without the switch, made here as always.
+    let cpu = std::sync::OnceLock::new();
+    if !(crate::detile::on() && crate::detile::ready()) {
+        let (buffer, data) = stage_buffer(host, total)?;
+        crate::host::name(&buffer, || {
+            format!(
+                "staging of {resource:?} {}x{}x{} f{}",
+                d.Width, d.Height, d.DepthOrArraySize, d.Format.0
+            )
+        });
+        STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+        let _ = cpu.set((buffer, data as usize));
+    }
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
-    STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
-        buffer,
+        cpu,
         #[cfg(feature = "diagnostics")]
         total,
-        data,
         footprints,
         rows,
         layout,

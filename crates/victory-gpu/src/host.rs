@@ -2478,6 +2478,10 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+    /// (Neptune) An upload of a texture detiled on the card (`crate::detile`): title memory
+    /// goes into the upload's slice and its detile into the submission's first list, every
+    /// time the list is submitted.
+    GpuTexture(std::sync::Arc<crate::texture::Staging>, std::sync::Arc<crate::detile::Upload>),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -3083,7 +3087,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 }
-                Step::Texture(staging) => {
+                Step::Texture(staging) | Step::GpuTexture(staging, _) => {
                     let (at, len) = staging.memory();
                     if touches(written, at, at + len) {
                         if count {
@@ -6034,6 +6038,17 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        // (Neptune) What the steps filled for the card's detile (`crate::detile`): its list
+        // goes ahead of every list of the submission, in the same call. (The first run's
+        // lists still start at 0: with timing on, the first group takes it with them.)
+        if crate::detile::on()
+            && let Some(pre) = crate::detile::pre_list()
+        {
+            lists.insert(0, Some(pre));
+            for first in firsts.iter_mut().skip(1) {
+                *first += 1;
+            }
+        }
         crate::watch::ask_once_end();
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
@@ -6066,6 +6081,9 @@ impl Host {
                 self.queue.ExecuteCommandLists(&lists);
                 self.queue.Signal(&self.fence, *submitted)
             };
+            if crate::detile::on() {
+                crate::detile::sent(*submitted);
+            }
             self.card_sent();
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
@@ -6145,6 +6163,10 @@ impl Host {
                 }
             }
             let _ = (i, started);
+        }
+        // (Neptune) The last group's value: every group of this submission is behind it.
+        if crate::detile::on() {
+            crate::detile::sent(*submitted);
         }
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
@@ -7293,6 +7315,16 @@ impl HostList {
         self.deferred().copies.push(Step::Texture(staging));
     }
 
+    /// (Neptune) [`HostList::defer_texture`] for an upload detiled on the card: its slices are
+    /// filled when the list is submitted, and held until it is reset.
+    pub(crate) fn defer_gpu_texture(
+        &self,
+        staging: std::sync::Arc<crate::texture::Staging>,
+        upload: std::sync::Arc<crate::detile::Upload>,
+    ) {
+        self.deferred().copies.push(Step::GpuTexture(staging, upload));
+    }
+
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
@@ -7370,6 +7402,13 @@ impl HostList {
                     if batch.texture_due(staging) {
                         staging.refresh();
                     }
+                    continue;
+                }
+                Step::GpuTexture(staging, upload) => {
+                    // Filled whatever the check says: the list's copy reads this slice. Later
+                    // checks of the texture in this submission find it current.
+                    batch.texture_due(staging);
+                    staging.gpu_fill(upload);
                     continue;
                 }
             };
@@ -8829,6 +8868,13 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
+    /// (Neptune) The last value the card reached on the host queue's fence: every
+    /// submission signalled at or below it has run.
+    pub(crate) fn completed(&self) -> u64 {
+        // SAFETY: a plain query.
+        unsafe { self.fence.GetCompletedValue() }
+    }
+
     /// The card's memory as the system accounts it to this process, in
     /// bytes: the budget and the use of the card's own memory, then of the
     /// PC's memory shared with the card (where the system moves what does
