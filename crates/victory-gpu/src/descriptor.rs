@@ -813,11 +813,16 @@ fn wait_for(resource: usize, handle: u64) {
 /// pointer to title texture), those shown only by title slots a draw makes
 /// again by itself (`HostHeap::slots_showing`), with those slots as (heap,
 /// index). A texture any other slot shows is left out.
+///
+/// (Neptune) A texture one of whose slots a draw's table showed after frame `cutoff` is left
+/// out too, and counted (the second result): a texture drawn through a table every frame
+/// never asks for its host copy again, so its last use is old although it is on screen.
 #[cfg(windows)]
 pub(crate) fn evictable_slots(
     raws: &std::collections::HashMap<usize, usize>,
     frame: u64,
-) -> std::collections::HashMap<usize, Vec<(usize, u32)>> {
+    cutoff: u64,
+) -> (std::collections::HashMap<usize, Vec<(usize, u32)>>, u64, u64) {
     let set: std::collections::HashSet<usize> = raws.keys().copied().collect();
     let heaps: Vec<usize> = SHADER_HEAPS
         .lock()
@@ -827,12 +832,16 @@ pub(crate) fn evictable_slots(
         .collect();
     let mut by_texture: std::collections::HashMap<usize, Vec<(usize, u32)>> = std::collections::HashMap::new();
     let mut blocked = std::collections::HashSet::new();
+    let mut seen = std::collections::HashSet::new();
     for at in heaps {
         // SAFETY: registered heaps are live (removed when dropped).
         let Some(Some(host)) = unsafe { &*(at as *const Heap) }.host.get() else {
             continue;
         };
-        for (index, raw, ok) in host.slots_showing(&set, frame) {
+        for (index, raw, ok, lately) in host.slots_showing(&set, frame, cutoff) {
+            if lately {
+                seen.insert(raw);
+            }
             if ok {
                 by_texture.entry(raw).or_default().push((at, index));
             } else {
@@ -840,8 +849,9 @@ pub(crate) fn evictable_slots(
             }
         }
     }
-    by_texture.retain(|raw, _| !blocked.contains(raw));
-    by_texture.into_iter().filter_map(|(raw, slots)| Some((*raws.get(&raw)?, slots))).collect()
+    let kept = seen.iter().filter(|raw| !blocked.contains(raw)).count() as u64;
+    by_texture.retain(|raw, _| !blocked.contains(raw) && !seen.contains(raw));
+    (by_texture.into_iter().filter_map(|(raw, slots)| Some((*raws.get(&raw)?, slots))).collect(), kept, blocked.len() as u64)
 }
 
 /// Puts the slots of title texture `resource` back to waiting for its host

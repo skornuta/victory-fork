@@ -491,6 +491,24 @@ const TABLED_GRACE: u64 = 8;
 
 /// In [`HostHeap::tabled`]: a draw read the slot in that frame.
 const TABLED_READ: u32 = 1 << 31;
+
+/// (Neptune) Whether a slot's table stamp ([`HostHeap::tabled`]: the frame a draw's table last
+/// showed it, plus one, in 31 bits; 0 never) is later than frame `cutoff`, seen from frame
+/// `frame`. A stamp without [`TABLED_READ`] counts too (a table showed the slot; whether the
+/// shader read it then is not known): the answer errs toward "used".
+pub(crate) fn seen_since(stamp: u32, cutoff: u64, frame: u64) -> bool {
+    let stamp = stamp & !TABLED_READ;
+    if stamp == 0 {
+        return false;
+    }
+    let mask = !TABLED_READ;
+    let now = (frame as u32).wrapping_add(1) & mask;
+    let cut = (cutoff as u32).wrapping_add(1) & mask;
+    // Ages back from now, in the stamps' 31 bits.
+    let age = now.wrapping_sub(stamp) & mask;
+    let limit = now.wrapping_sub(cut) & mask;
+    age < limit
+}
 /// (Neptune) The slots of a block of [`HostHeap::tabled_blocks`].
 const TABLED_BLOCK: u32 = 64;
 
@@ -1715,11 +1733,17 @@ impl HostHeap {
     /// ([`HostHeap::mirror`]). Slots only shaders pick by index (nothing
     /// would make them again) and dynamic ones (a list not yet reset) are
     /// not.
+    ///
+    /// (Neptune) And, per slot, whether a draw's table showed it after frame `cutoff`
+    /// ([`seen_since`]): a texture a draw reads through a table every frame never asks for its
+    /// host copy again (the slot shows it already, `HostHeap::mirror`), so its last use says
+    /// nothing of that, and only the slot's table stamp does.
     pub(crate) fn slots_showing(
         &self,
         raws: &std::collections::HashSet<usize>,
         frame: u64,
-    ) -> Vec<(u32, usize, bool)> {
+        cutoff: u64,
+    ) -> Vec<(u32, usize, bool, bool)> {
         self.kept
             .iter()
             .enumerate()
@@ -1731,7 +1755,8 @@ impl HostHeap {
                 };
                 raws.contains(&raw).then(|| {
                     let i = i as u32;
-                    (i, raw, i < self.count && !self.sampler && self.tabled_lately(i, frame))
+                    let ok = i < self.count && !self.sampler && self.tabled_lately(i, frame);
+                    (i, raw, ok, seen_since(self.tabled_stamp(i), cutoff, frame))
                 })
             })
             .collect()
