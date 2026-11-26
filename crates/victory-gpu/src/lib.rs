@@ -62,7 +62,11 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
+mod memtel;
+#[cfg(windows)]
 mod ramline;
+#[cfg(windows)]
+pub use ramline::use_memory_path;
 #[cfg(windows)]
 mod shadow;
 #[cfg(windows)]

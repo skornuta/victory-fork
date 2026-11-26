@@ -23,6 +23,9 @@ pub fn run(
     if std::env::var_os("VICTORY_FRAMETIME_DUMP").is_some_and(|v| v.to_str() == Some("1")) {
         victory_gpu::frametime::use_dump_path(cfg.cache_dir.join("frametime.csv"));
     }
+    // (Neptune) The memory minute's rows, beside the rest of Victory's cache.
+    #[cfg(windows)]
+    victory_gpu::use_memory_path(cfg.cache_dir.join("memory.csv"));
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();

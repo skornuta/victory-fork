@@ -928,6 +928,18 @@ fn land_checks(state: &mut State, completed: u64) {
     }
 }
 
+/// For the memory minute: bytes of the raw and the card's ring reserved or waiting for the
+/// card, the rings' sizes, and uploads sent the CPU's way since the start (zeros without the
+/// switch, or before the rings are made).
+pub(crate) fn memory() -> [u64; 5] {
+    let refused = (0..8).map(|i| STATS[WHY_AT + i].load(Relaxed)).sum();
+    let guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    match guard.as_ref() {
+        Some(s) => [s.raw_arena.used(), s.out_arena.used(), s.raw_arena.size(), s.out_arena.size(), refused],
+        None => [0, 0, 0, 0, refused],
+    }
+}
+
 /// Every ten seconds, with the switch on: what went to the card and what did not.
 fn status() {
     static LAST: AtomicU64 = AtomicU64::new(0);

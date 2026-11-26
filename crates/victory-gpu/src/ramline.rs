@@ -249,11 +249,210 @@ fn sampler() {
                 mb(s.1),
                 mb(c.WorkingSetSize as u64),
                 started.elapsed().as_millis(),
-                mb(victory_core::heapcount::RUST_HEAP[0].load(Relaxed)),
+                mb(victory_core::heapcount::sample()),
                 mb(victory_core::heapcount::RUST_HEAP[1].load(Relaxed)),
             );
+            // (Neptune) Every other pass (once a minute): the memory minute, from this pass.
+            static PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if PASSES.fetch_add(1, Relaxed) % 2 == 1 {
+                let k = |i: usize| (by_kind[i].0, by_kind[i].1);
+                minute(&Resident {
+                    title: [k(0), k(1), k(2), k(3)],
+                    other_private: (private.1, private.0),
+                    other_mapped: (mapped.1, mapped.0),
+                    buffers: (total(&buffers), b.0),
+                    windows: (total(&windows), w.0),
+                    staging: (total(&staging), s.0),
+                });
+            }
         });
     });
+}
+
+/// (Neptune) What one pass of the resident sampler found, each as (committed, resident) bytes:
+/// the title's images, page views, virtual allocations and heap blocks, what is left of the
+/// private and the mapped regions, and the host copies' CPU sides and the staging buffers.
+struct Resident {
+    title: [(u64, u64); 4],
+    other_private: (u64, u64),
+    other_mapped: (u64, u64),
+    buffers: (u64, u64),
+    windows: (u64, u64),
+    staging: (u64, u64),
+}
+
+/// Where the memory minute's rows go (`apps/victory` passes `<cache>\memory.csv`;
+/// `%TEMP%\victory-memory.csv` without). `VICTORY_MEMORY_CSV=<path>` names another,
+/// `VICTORY_MEMORY_CSV=0` writes none (the log line stays).
+static MEMORY_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Points the memory minute's rows at `path`. Call before the title starts.
+pub fn use_memory_path(path: std::path::PathBuf) {
+    let _ = MEMORY_PATH.set(path);
+}
+
+/// The memory minute's columns, in megabytes unless named otherwise.
+const COLUMNS: &str = "unix_s,frame,\
+proc_private,proc_peak_private,proc_working_set,sys_avail_phys,sys_commit,sys_commit_limit,\
+vram_budget,vram_used,sysmem_gpu_budget,sysmem_gpu_used,\
+title_images,title_page_views,title_virtual,title_heap,title_page_views_res,title_virtual_res,\
+host_buffer_cpu,host_window_cpu,texture_staging,snapshot_pool,\
+rust_heap,d3d12_upload,d3d12_shared,d3d12_gpu_upload,d3d12_ours_unranged,sysmem_gpu_untracked,\
+other_private,other_private_res,other_mapped,unattributed_private,\
+host_lists,preludes_made,idle_lists,list_scratch,\
+card_copies,tex_filled,tex_filled_placed,tex_targets,tex_depth,tex_uav,tex_twins,tex_idle_held,\
+detile_raw_used,detile_card_used,detile_raw_size,detile_card_size,detile_to_cpu";
+
+/// (Neptune) Once a minute, from the resident sampler's thread: one row of the memory
+/// breakdown into the memory CSV, and the same derived in one log line. What we track (title
+/// memory, host copies, staging, the Rust heap, our CPU-visible D3D12 buffers) is told from
+/// what is left: `unattributed_private` is the private memory no category names, the driver's
+/// own (command memory, the system's backing for it) among it.
+fn minute(r: &Resident) {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mb = |v: u64| v >> 20;
+    let mut c = PROCESS_MEMORY_COUNTERS_EX { cb: size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32, ..Default::default() };
+    // SAFETY: our own process and a sized structure (the extended form, as `cb` says).
+    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut c).cast::<PROCESS_MEMORY_COUNTERS>(), c.cb) };
+    let mut p = PERFORMANCE_INFORMATION { cb: size_of::<PERFORMANCE_INFORMATION>() as u32, ..Default::default() };
+    // SAFETY: a sized structure.
+    unsafe { K32GetPerformanceInfo(&mut p, p.cb) };
+    let page = p.PageSize as u64;
+    let card = crate::host::host().and_then(|h| h.video_memory()).unwrap_or_default();
+    let heap = victory_core::heapcount::sample();
+    let d3d = crate::memtel::alive();
+    let copies = crate::shadow::memory();
+    let alive: Vec<u64> = crate::host::ALIVE.iter().map(|a| a.load(Relaxed)).collect();
+    let vk: Vec<u64> = crate::resource::VRAM_KINDS.iter().map(|k| k.load(Relaxed)).collect();
+    let det = crate::detile::memory();
+    // Our buffers in the PC's memory that no range above names: their CPU sides are the host
+    // copies and the staging buffers, which the sampler took first.
+    let ranged = r.buffers.0 + r.windows.0 + r.staging.0;
+    let ours_unranged = (d3d[0] + d3d[1]).saturating_sub(ranged);
+    // What the system counts of the process's memory shared with the card beyond our buffers.
+    let untracked = card[3].saturating_sub(d3d[0] + d3d[1]);
+    let unattributed = r.other_private.0.saturating_sub(heap + ours_unranged);
+    let row: Vec<u64> = vec![
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()),
+        crate::frame::current(),
+        mb(c.PrivateUsage as u64),
+        mb(c.PeakPagefileUsage as u64),
+        mb(c.WorkingSetSize as u64),
+        mb(p.PhysicalAvailable as u64 * page),
+        mb(p.CommitTotal as u64 * page),
+        mb(p.CommitLimit as u64 * page),
+        mb(card[0]),
+        mb(card[1]),
+        mb(card[2]),
+        mb(card[3]),
+        mb(r.title[0].0),
+        mb(r.title[1].0),
+        mb(r.title[2].0),
+        mb(r.title[3].0),
+        mb(r.title[1].1),
+        mb(r.title[2].1),
+        mb(r.buffers.0),
+        mb(r.windows.0),
+        mb(r.staging.0),
+        mb(copies[5]),
+        mb(heap),
+        mb(d3d[0]),
+        mb(d3d[1]),
+        mb(d3d[2]),
+        mb(ours_unranged),
+        mb(untracked),
+        mb(r.other_private.0),
+        mb(r.other_private.1),
+        mb(r.other_mapped.0),
+        mb(unattributed),
+        alive[0],
+        crate::host::LISTS[1].load(Relaxed),
+        crate::list::idle_pool().0,
+        mb(alive[2]),
+        mb(crate::shadow::card_copy_bytes()[0]),
+        mb(vk[0]),
+        mb(vk[1]),
+        mb(vk[2]),
+        mb(vk[3]),
+        mb(vk[4]),
+        mb(vk[5]),
+        mb(vk[6]),
+        mb(det[0]),
+        mb(det[1]),
+        mb(det[2]),
+        mb(det[3]),
+        det[4],
+    ];
+    tracing::info!(
+        "memory minute: private {} MB (peak {} MB), working set {} MB, PC free {} MB, system commit {} of {} MB; \
+         card {} of {} MB, shared with the card {} MB; tracked: title {} MB (page views {} MB mapped, not private), \
+         host copies {} MB, staging {} MB, rust heap {} MB, our D3D12 buffers {} MB upload + {} MB shared + {} MB GPU upload \
+         ({} MB of them not in a range above); not ours in the shared count {} MB; left: private {} MB, mapped {} MB, \
+         unattributed private {} MB; host lists {}, preludes {}",
+        row[2],
+        row[3],
+        row[4],
+        row[5],
+        row[6],
+        row[7],
+        row[9],
+        row[8],
+        row[11],
+        row[12] + row[14] + row[15],
+        row[13],
+        row[18] + row[19],
+        row[20],
+        row[22],
+        row[23],
+        row[24],
+        row[25],
+        row[26],
+        row[27],
+        row[28],
+        row[30],
+        row[31],
+        row[32],
+        row[33],
+    );
+    write_row(&row);
+}
+
+/// Appends `row` to the memory CSV, made with a header (the switches the run was started with,
+/// then [`COLUMNS`]) on the first row.
+fn write_row(row: &[u64]) {
+    use std::io::Write;
+    static FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var_os("VICTORY_MEMORY_CSV").is_some_and(|v| v == "0")) {
+        return;
+    }
+    let mut file = FILE.lock().unwrap_or_else(|e| e.into_inner());
+    if file.is_none() {
+        let path = std::env::var_os("VICTORY_MEMORY_CSV")
+            .map(std::path::PathBuf::from)
+            .or_else(|| MEMORY_PATH.get().cloned())
+            .unwrap_or_else(|| std::env::temp_dir().join("victory-memory.csv"));
+        let Ok(mut made) = std::fs::File::create(&path) else {
+            tracing::warn!(path = %path.display(), "memory minute: the CSV could not be made");
+            let _ = OFF.set(true);
+            return;
+        };
+        let mut switches: Vec<String> =
+            std::env::vars().filter(|(k, _)| k.starts_with("VICTORY_")).map(|(k, v)| format!("{k}={v}")).collect();
+        switches.sort();
+        let _ = writeln!(made, "# switches: {}", switches.join(" "));
+        let _ = writeln!(made, "{COLUMNS}");
+        tracing::info!(path = %path.display(), "memory minute: a row a minute");
+        *file = Some(made);
+    }
+    if let Some(f) = file.as_mut() {
+        let text: Vec<String> = row.iter().map(u64::to_string).collect();
+        let _ = writeln!(f, "{}", text.join(","));
+        let _ = f.flush();
+    }
 }
 
 /// Logs one line, called every five seconds from the host's frame stats.
@@ -300,7 +499,7 @@ pub(crate) fn log() {
         idle,
         mb(idle_bytes),
         crate::list::TRIMMED_LISTS.load(Relaxed),
-        mb(victory_core::heapcount::RUST_HEAP[0].load(Relaxed)),
+        mb(victory_core::heapcount::sample()),
         mb(crate::watch::NOTIFIED.swap(0, Relaxed)),
     );
     tracing::info!(

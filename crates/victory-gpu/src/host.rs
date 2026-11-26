@@ -7999,7 +7999,11 @@ impl Host {
                 })
         };
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                let buffer = buffer?;
+                crate::memtel::track(&buffer, crate::memtel::UPLOAD, size);
+                Some((buffer, data.cast()))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no upload buffer");
                 None
@@ -9003,7 +9007,11 @@ impl Host {
                 })
         };
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                let buffer = buffer?;
+                crate::memtel::track(&buffer, crate::memtel::SHARED, size);
+                Some((buffer, data.cast()))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
                 None
@@ -9063,7 +9071,11 @@ impl Host {
                 })
         };
         match made {
-            Ok(()) if !data.is_null() => Some((buffer?, data.cast())),
+            Ok(()) if !data.is_null() => {
+                let buffer = buffer?;
+                crate::memtel::track(&buffer, crate::memtel::GPU_UPLOAD, size);
+                Some((buffer, data.cast()))
+            }
             Ok(()) => None,
             Err(e) => {
                 tracing::warn!(error = %e, size, "no GPU upload buffer");
