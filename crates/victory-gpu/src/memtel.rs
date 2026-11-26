@@ -65,6 +65,81 @@ mod tests {
     use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
     use windows::Win32::Graphics::Dxgi::*;
 
+    /// The process's private bytes.
+    fn private() -> u64 {
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut c = PROCESS_MEMORY_COUNTERS_EX { cb: size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32, ..Default::default() };
+        // SAFETY: our own process and a sized structure.
+        unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut c).cast::<PROCESS_MEMORY_COUNTERS>(), c.cb) };
+        c.PrivateUsage as u64
+    }
+
+    /// What the card's memory and command memory cost in the process's private bytes, on the
+    /// card itself (`VICTORY_MEMTEL_CARD=1 cargo test -p victory-gpu memtel -- --ignored
+    /// --nocapture`): 2 GB of buffers in the card's memory, then 300 command allocators with a
+    /// list each that recorded a few thousand commands. Prints what each step added.
+    #[test]
+    #[ignore]
+    fn card_what_card_memory_and_command_memory_cost_in_private_bytes() {
+        if std::env::var_os("VICTORY_MEMTEL_CARD").is_none_or(|v| v != "1") {
+            return;
+        }
+        // SAFETY: plain object creation on the default adapter.
+        let device = unsafe {
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).unwrap();
+            device.unwrap()
+        };
+        let mb = |v: u64| v as i64 >> 20;
+        let start = private();
+        let buffer = |heap: D3D12_HEAP_TYPE, bytes: u64| {
+            let heap = D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: bytes,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut b: Option<ID3D12Resource> = None;
+            let state = if heap.Type == D3D12_HEAP_TYPE_UPLOAD { D3D12_RESOURCE_STATE_GENERIC_READ } else { D3D12_RESOURCE_STATE_COMMON };
+            // SAFETY: plain creation.
+            unsafe { device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut b).unwrap() };
+            b.unwrap()
+        };
+        let card: Vec<_> = (0..4).map(|_| buffer(D3D12_HEAP_TYPE_DEFAULT, 512 << 20)).collect();
+        let after_card = private();
+        let upload = buffer(D3D12_HEAP_TYPE_UPLOAD, 512 << 20);
+        let after_upload = private();
+        let mut lists = Vec::new();
+        for _ in 0..300 {
+            // SAFETY: plain creation and recording of a list that is never executed.
+            unsafe {
+                let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let list: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+                for _ in 0..4000 {
+                    list.CopyBufferRegion(&card[0], 0, &card[1], 0, 256);
+                }
+                list.Close().unwrap();
+                lists.push((allocator, list));
+            }
+        }
+        let after_lists = private();
+        println!(
+            "private bytes: start {} MB; +2048 MB of card buffers: +{} MB; +512 MB upload buffer: +{} MB; \
+             +300 allocators with a 4,000-command list each: +{} MB",
+            mb(start),
+            mb(after_card) - mb(start),
+            mb(after_upload) - mb(after_card),
+            mb(after_lists) - mb(after_upload)
+        );
+        drop((card, upload, lists));
+    }
+
     /// A tracked buffer counts while it lives, whoever lets it go, and not after.
     #[test]
     fn warp_a_tracked_buffer_counts_until_it_is_destroyed() {

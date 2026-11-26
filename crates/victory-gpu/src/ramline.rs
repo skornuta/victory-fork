@@ -301,7 +301,7 @@ rust_heap,d3d12_upload,d3d12_shared,d3d12_gpu_upload,d3d12_ours_unranged,sysmem_
 other_private,other_private_res,other_mapped,unattributed_private,\
 host_lists,preludes_made,idle_lists,list_scratch,\
 card_copies,tex_filled,tex_filled_placed,tex_targets,tex_depth,tex_uav,tex_twins,tex_idle_held,\
-detile_raw_used,detile_card_used,detile_raw_size,detile_card_size,detile_to_cpu";
+detile_raw_used,detile_card_used,detile_raw_size,detile_card_size,detile_to_cpu,vram_commit_backing,residual_private";
 
 /// (Neptune) Once a minute, from the resident sampler's thread: one row of the memory
 /// breakdown into the memory CSV, and the same derived in one log line. What we track (title
@@ -335,6 +335,11 @@ fn minute(r: &Resident) {
     // What the system counts of the process's memory shared with the card beyond our buffers.
     let untracked = card[3].saturating_sub(d3d[0] + d3d[1]);
     let unattributed = r.other_private.0.saturating_sub(heap + ours_unranged);
+    // The system charges the process commit for every byte of the card's memory it holds (2,048 MB
+    // of buffers there added 2,053 MB of private bytes on the RTX 5080: `memtel`'s card test): of
+    // what no category names, that much is the card's own, and the rest the driver's (command
+    // memory, about 1.5 MB an allocator in that test) and whatever else is left.
+    let residual = unattributed.saturating_sub(card[1]);
     let row: Vec<u64> = vec![
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()),
         crate::frame::current(),
@@ -385,13 +390,15 @@ fn minute(r: &Resident) {
         mb(det[2]),
         mb(det[3]),
         det[4],
+        mb(card[1]),
+        mb(residual),
     ];
     tracing::info!(
         "memory minute: private {} MB (peak {} MB), working set {} MB, PC free {} MB, system commit {} of {} MB; \
          card {} of {} MB, shared with the card {} MB; tracked: title {} MB (page views {} MB mapped, not private), \
          host copies {} MB, staging {} MB, rust heap {} MB, our D3D12 buffers {} MB upload + {} MB shared + {} MB GPU upload \
          ({} MB of them not in a range above); not ours in the shared count {} MB; left: private {} MB, mapped {} MB, \
-         unattributed private {} MB; host lists {}, preludes {}",
+         unattributed private {} MB (of it the commit the system holds for our {} MB of the card's memory, the rest {} MB: \n         command memory and the driver's own); host lists {}, preludes {}",
         row[2],
         row[3],
         row[4],
@@ -414,6 +421,8 @@ fn minute(r: &Resident) {
         row[28],
         row[30],
         row[31],
+        row[49],
+        row[50],
         row[32],
         row[33],
     );
