@@ -94,6 +94,12 @@ pub(crate) fn current() -> u64 {
     FRAME.load(Ordering::Relaxed)
 }
 
+/// (Neptune) [`current`], for the app's hang watch: a title that stops beginning frames is
+/// stuck somewhere.
+pub fn begun() -> u64 {
+    current()
+}
+
 /// Per event kind (origin, vblank, flip and later kinds): the last tick a
 /// wait for it ended on.
 static LAST: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];

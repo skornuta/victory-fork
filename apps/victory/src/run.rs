@@ -119,6 +119,8 @@ pub fn run(
     }
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
+    #[cfg(windows)]
+    hang_watch();
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
@@ -140,6 +142,39 @@ pub fn run(
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");
     Ok(())
+}
+
+/// (Neptune) `VICTORY_HANG_WATCH_S=<seconds>` (off by default): when the title has begun no
+/// frame for that long, every thread's stack goes to the log (`victory_loader::dump_stacks`),
+/// and once more at twice that; then nothing until frames begin again. A title whose frame
+/// stands for half a minute ends itself (its watchdog writes to address 0): the dump names
+/// what stood. Counted from the first frame on; a thread of its own, a look a second.
+#[cfg(windows)]
+fn hang_watch() {
+    let Some(after) = std::env::var("VICTORY_HANG_WATCH_S").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&s| s > 0)
+    else {
+        return;
+    };
+    let _ = std::thread::Builder::new().name("victory-hang-watch".into()).spawn(move || {
+        let (mut last, mut since, mut dumps) = (0u64, std::time::Instant::now(), 0u32);
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let frame = victory_gpu::frame::begun();
+            if frame != last {
+                (last, since, dumps) = (frame, std::time::Instant::now(), 0);
+                continue;
+            }
+            if frame == 0 {
+                continue;
+            }
+            let stood = since.elapsed().as_secs();
+            if (dumps == 0 && stood >= after) || (dumps == 1 && stood >= 2 * after) {
+                dumps += 1;
+                eprintln!("VIctory: hang watch: no frame begun for {stood} s (frame {frame}); every thread's stack:");
+                victory_loader::dump_stacks();
+            }
+        }
+    });
 }
 
 /// The debugging aids (README): scheduled stack dumps, watched values and
