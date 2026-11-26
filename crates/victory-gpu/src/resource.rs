@@ -2061,6 +2061,12 @@ pub(crate) fn let_go_idle() {
             crate::host::retire(host);
         }
     }
+    // (Neptune) The table of textures is let go first: `slot_evict` takes it itself, and
+    // a lock taken twice by one thread waits for ever. That was the hang of every run with
+    // `VICTORY_SLOT_EVICT=1` as soon as the card passed its line (the submitting thread stood
+    // in `textures()` under `Host::submit`'s sweep, no frame began, and the title's watchdog
+    // wrote to address 0 thirty seconds later; `VICTORY_HANG_WATCH_S` showed it).
+    drop(all);
     slot_evict(video, idle_ms, IDLE_FRAMES);
     if went > 0 {
         crate::host::trail(|| {
