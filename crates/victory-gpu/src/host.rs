@@ -938,6 +938,79 @@ pub(crate) fn allocator_trim() -> Option<u64> {
     })
 }
 
+/// (Neptune) Whether host lists' preludes come from one shared pool (`VICTORY_PRELUDE_POOL=1`;
+/// off by default). A prelude runs in one submission only: the transitions and twin copies its
+/// list needs before it, recorded again at each submission of the list. Each host list kept a
+/// prelude of its own (an allocator and a list) for as long as it lived: some 870 in the first
+/// area, and on the RTX 5080 an allocator with a list that recorded anything costs ~0.85 MB of
+/// private memory however little it holds (`memtel` tests). With the switch a prelude is taken
+/// from the pool when a submission records one, and goes back to it once that submission has
+/// passed its fence ([`prelude_pool_sent`]); idle ones past [`PRELUDE_POOL_IDLE`] are let go.
+pub(crate) fn prelude_pool() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRELUDE_POOL").is_some_and(|v| v == "1"))
+}
+
+/// The most idle preludes the pool keeps.
+const PRELUDE_POOL_IDLE: usize = 64;
+
+/// Preludes of the pool: allocator, list, and the fence value of the submission that last ran
+/// it (0: never sent; `u64::MAX`: recorded for the submission being made, not sent yet).
+static PRELUDE_POOL: Mutex<Vec<(ID3D12CommandAllocator, ID3D12GraphicsCommandList, u64)>> = Mutex::new(Vec::new());
+
+/// (Neptune) Preludes of the pool alive, and made so far.
+pub(crate) static PRELUDE_POOL_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// A prelude of the pool whose last submission has run, or a new one: taken out of the pool
+/// until recorded. Whether it is new.
+fn take_prelude() -> (ID3D12CommandAllocator, ID3D12GraphicsCommandList, bool) {
+    let completed = host().map_or(0, |h| h.completed());
+    {
+        let mut pool = PRELUDE_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = pool.iter().position(|p| p.2 != u64::MAX && p.2 <= completed) {
+            let (allocator, list, _) = pool.swap_remove(at);
+            return (allocator, list, false);
+        }
+    }
+    let Some((allocator, list)) = host().and_then(|h| h.make_prelude()) else {
+        fail(format_args!("no host list for a state prelude (VICTORY_PRELUDE_POOL=1)"));
+    };
+    PRELUDE_POOL_STATS[0].fetch_add(1, Ordering::Relaxed);
+    PRELUDE_POOL_STATS[1].fetch_add(1, Ordering::Relaxed);
+    (allocator, list, true)
+}
+
+/// After a submission is sent with fence value `fence`: the preludes recorded for it run under
+/// that value; idle ones past [`PRELUDE_POOL_IDLE`] are let go (their submissions have run).
+pub(crate) fn prelude_pool_sent(fence: u64) {
+    if !prelude_pool() {
+        return;
+    }
+    let completed = host().map_or(0, |h| h.completed());
+    let gone = {
+        let mut pool = PRELUDE_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        for p in pool.iter_mut().filter(|p| p.2 == u64::MAX) {
+            p.2 = fence;
+        }
+        let idle = pool.iter().filter(|p| p.2 <= completed).count();
+        let mut extra = idle.saturating_sub(PRELUDE_POOL_IDLE);
+        let mut gone = Vec::new();
+        let mut i = 0;
+        while extra > 0 && i < pool.len() {
+            if pool[i].2 <= completed {
+                gone.push(pool.swap_remove(i));
+                extra -= 1;
+            } else {
+                i += 1;
+            }
+        }
+        gone
+    };
+    PRELUDE_POOL_STATS[0].fetch_sub(gone.len() as u64, Ordering::Relaxed);
+    // Let go outside the lock; their submissions have run.
+    drop(gone);
+}
+
 /// (Neptune) Since the start: host list allocators and prelude allocators taken anew
 /// ([`allocator_trim`]).
 pub(crate) static ALLOCATOR_TRIMS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
@@ -6193,6 +6266,7 @@ impl Host {
             if crate::detile::on() {
                 crate::detile::sent(*submitted);
             }
+            crate::host::prelude_pool_sent(*submitted);
             self.card_sent();
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
@@ -6280,6 +6354,7 @@ impl Host {
         if crate::detile::on() {
             crate::detile::sent(*submitted);
         }
+        crate::host::prelude_pool_sent(*submitted);
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
         bury(this_submission);
@@ -7004,19 +7079,10 @@ impl HostList {
         if barriers.is_empty() && syncs.is_empty() && ahead.is_empty() {
             return None;
         }
-        let Some((allocator, list)) = self
-            .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()).map(|(a, l)| (Mutex::new((a, now_ms())), l)))
-            .as_ref()
-        else {
-            fail(format_args!("no host list for a state prelude"));
-        };
-        let mut allocator = allocator.lock().unwrap_or_else(|e| e.into_inner());
-        let fresh = allocator_refresh(&mut allocator, &ALLOCATOR_TRIMS[1]);
-        let allocator = &allocator.0;
-        // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
-        let recorded = unsafe {
+        // SAFETY (for both kinds of prelude below): the allocator's last list has run (a pooled
+        // one's submission passed its fence; a list's own one ran before the list's reset, and
+        // every submission is waited for); the textures are live.
+        let record = |allocator: &ID3D12CommandAllocator, list: &ID3D12GraphicsCommandList, fresh: bool| unsafe {
             (if fresh { Ok(()) } else { allocator.Reset() }).and_then(|()| {
                 list.Reset(allocator, None)?;
                 if !to_copy.is_empty() {
@@ -7035,7 +7101,27 @@ impl HostList {
                 list.Close()
             })
         };
-        if let Err(e) = recorded {
+        // (Neptune) With `VICTORY_PRELUDE_POOL=1`: a prelude of the shared pool, given back when
+        // this submission has run ([`prelude_pool`]).
+        if prelude_pool() {
+            let (allocator, list, made) = take_prelude();
+            if let Err(e) = record(&allocator, &list, made) {
+                fail(format_args!("a host state prelude did not record ({e})"));
+            }
+            let out = list.cast().ok();
+            PRELUDE_POOL.lock().unwrap_or_else(|e| e.into_inner()).push((allocator, list, u64::MAX));
+            return out;
+        }
+        let Some((allocator, list)) = self
+            .prelude
+            .get_or_init(|| host().and_then(|h| h.make_prelude()).map(|(a, l)| (Mutex::new((a, now_ms())), l)))
+            .as_ref()
+        else {
+            fail(format_args!("no host list for a state prelude"));
+        };
+        let mut allocator = allocator.lock().unwrap_or_else(|e| e.into_inner());
+        let fresh = allocator_refresh(&mut allocator, &ALLOCATOR_TRIMS[1]);
+        if let Err(e) = record(&allocator.0, list, fresh) {
             fail(format_args!("a host state prelude did not record ({e})"));
         }
         list.cast().ok()

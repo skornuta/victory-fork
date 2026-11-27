@@ -185,6 +185,124 @@ mod tests {
         drop((card, upload, lists));
     }
 
+    /// (Neptune) What small command lists cost in private bytes, on the card itself
+    /// (`VICTORY_MEMTEL_CARD=1 cargo test -p victory-gpu memtel -- --ignored --nocapture`):
+    /// 1,000 allocators with a list each, open and empty (as a host list waits after its
+    /// reset); 1,000 with a few barriers recorded and closed (as a prelude stands); and the
+    /// same allocators reset with their lists recording again.
+    #[test]
+    #[ignore]
+    fn card_what_small_command_lists_cost_in_private_bytes() {
+        if std::env::var_os("VICTORY_MEMTEL_CARD").is_none_or(|v| v != "1") {
+            return;
+        }
+        // SAFETY: plain object creation on the default adapter.
+        let device = unsafe {
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).unwrap();
+            device.unwrap()
+        };
+        let kb = |a: u64, b: u64| (b as i64 - a as i64) / 1024 / 1000;
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 1 << 20,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut b: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation.
+        unsafe { device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut b).unwrap() };
+        let buffer = b.unwrap();
+        let make = || -> (ID3D12CommandAllocator, ID3D12GraphicsCommandList) {
+            // SAFETY: plain creation.
+            unsafe {
+                let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let list = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+                (allocator, list)
+            }
+        };
+        let barriers = |list: &ID3D12GraphicsCommandList| {
+            let uav = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                        // SAFETY: a borrowed pointer the barrier never releases.
+                        pResource: unsafe { std::mem::transmute_copy(&buffer) },
+                    }),
+                },
+                ..Default::default()
+            };
+            // SAFETY: an open list; a live buffer.
+            unsafe {
+                for _ in 0..8 {
+                    list.ResourceBarrier(&[uav.clone()]);
+                }
+                list.Close().unwrap();
+            }
+        };
+        // The driver's first lists set up what every later one shares: not counted.
+        let warm: Vec<_> = (0..200).map(|_| make()).collect();
+        // SAFETY: an open list of ours: closed so its allocator can make others.
+        unsafe { warm[0].1.Close().unwrap() };
+        // Allocators alone, and lists alone (closed, all made on one allocator).
+        let before = private();
+        // SAFETY: plain creation.
+        let allocators: Vec<ID3D12CommandAllocator> =
+            (0..1000).map(|_| unsafe { device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap() }).collect();
+        let after_allocators = private();
+        let lists: Vec<ID3D12GraphicsCommandList> = (0..1000)
+            .map(|_| {
+                // SAFETY: plain creation; each list is closed before the allocator makes the next.
+                unsafe {
+                    let list: ID3D12GraphicsCommandList =
+                        device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &warm[0].0, None).unwrap();
+                    list.Close().unwrap();
+                    list
+                }
+            })
+            .collect();
+        let after_lists = private();
+        println!(
+            "private bytes: an allocator alone {} KB, a closed list alone {} KB",
+            kb(before, after_allocators),
+            kb(after_allocators, after_lists)
+        );
+        drop((allocators, lists));
+        let start = private();
+        let open: Vec<_> = (0..1000).map(|_| make()).collect();
+        let after_open = private();
+        let closed: Vec<_> = (0..1000)
+            .map(|_| {
+                let pair = make();
+                barriers(&pair.1);
+                pair
+            })
+            .collect();
+        let after_closed = private();
+        for (allocator, list) in &closed {
+            // SAFETY: never executed: nothing runs from the allocator.
+            unsafe {
+                allocator.Reset().unwrap();
+                list.Reset(allocator, None).unwrap();
+            }
+        }
+        let after_reset = private();
+        println!(
+            "private bytes per allocator with its list: open and empty {} KB; 8 barriers recorded and closed {} KB; \
+             those reset and recording again: {} KB less each",
+            kb(start, after_open),
+            kb(after_open, after_closed),
+            kb(after_reset, after_closed)
+        );
+        drop((open, closed, buffer));
+    }
+
     /// A tracked buffer counts while it lives, whoever lets it go, and not after.
     #[test]
     fn warp_a_tracked_buffer_counts_until_it_is_destroyed() {
