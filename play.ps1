@@ -94,6 +94,9 @@ $set = [ordered]@{
   VICTORY_ALLOCATOR_TRIM      = '1'         # command allocators taken anew every 30 s (they keep their largest recording)
   VICTORY_PRELUDE_POOL        = '1'         # host lists' preludes from one shared pool (each kept one of its own: ~0.85 MB each)
   VICTORY_STAGE_POOL_MB       = '64'        # spare texture staging buffers kept (256 by default; the world uses about 25 MB)
+  VICTORY_CARD_WINDOW_UPLOAD_MB = '256'     # pool of the card windows' upload buffers (512 MB by default)
+  VICTORY_BUDGET_PACK         = '1'         # host lists' indirect budgets are 256-byte slots of shared 64 KiB buffers
+  VICTORY_COMPARE_PIECES      = '1'         # refreshes compare 1 MiB at a time (each thread kept a buffer as large as its largest range)
 }
 if (-not $NoAutoA) { $set['VICTORY_AUTO_A'] = '150' }   # taps A through the start screens for 150 s
 if ($FrametimeDump) { $set['VICTORY_FRAMETIME_DUMP'] = '1' }
