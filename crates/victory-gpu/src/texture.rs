@@ -1514,7 +1514,8 @@ fn upload_on_card(list: &HostList, resource: This, texture: &ID3D12Resource, sta
         let mut placed = *footprint;
         placed.Offset += upload.out_offset();
         let from = D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: as above; the ring lives for the run.
+            // SAFETY: as above; the ring is not resized while the upload, held by the
+            // list until its reset, lives (`crate::detile::fit`).
             pResource: unsafe { std::mem::transmute_copy(&out) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: placed },
