@@ -1701,17 +1701,21 @@ fn scratch_pool() -> bool {
 struct Spare<T> {
     kept: Vec<(T, u64)>,
     bytes: u64,
+    /// (Neptune) The fewest bytes kept since the last [`Spare::trim`]: kept all that while
+    /// and never asked for.
+    low: u64,
 }
 
 impl<T> Spare<T> {
     const fn new() -> Self {
-        Spare { kept: Vec::new(), bytes: 0 }
+        Spare { kept: Vec::new(), bytes: 0, low: 0 }
     }
 
     /// A kept thing of `size` bytes, the one given last.
     fn take(&mut self, size: u64) -> Option<T> {
         let at = self.kept.iter().rposition(|(_, s)| *s == size)?;
         self.bytes -= size;
+        self.low = self.low.min(self.bytes);
         Some(self.kept.remove(at).0)
     }
 
@@ -1724,6 +1728,21 @@ impl<T> Spare<T> {
         self.bytes += size;
         self.kept.push((thing, size));
         None
+    }
+
+    /// (Neptune) Takes out the oldest things kept, up to the fewest bytes kept since the last
+    /// trim (none of those was asked for in all that time), to be freed.
+    fn trim(&mut self) -> Vec<(T, u64)> {
+        let mut out = Vec::new();
+        let mut left = self.low;
+        while let Some(at) = self.kept.iter().position(|(_, s)| *s <= left) {
+            let (thing, size) = self.kept.remove(at);
+            left -= size;
+            self.bytes -= size;
+            out.push((thing, size));
+        }
+        self.low = self.bytes;
+        out
     }
 }
 
@@ -1782,9 +1801,30 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
             }
         }
     }
+    // (Neptune) With `VICTORY_ALLOCATOR_TRIM=1`, every ten seconds: the chunks kept all that
+    // while and never taken go too.
+    if crate::host::allocator_trim().is_some() {
+        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now = now_ms();
+        let last = LAST.load(Ordering::Relaxed);
+        if now >= last + 10_000 && LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+            let trimmed = SPARE.lock().unwrap_or_else(|e| e.into_inner()).trim();
+            for (chunk, size) in trimmed {
+                ALIVE[3].fetch_sub(1, Ordering::Relaxed);
+                ALIVE[4].fetch_sub(size, Ordering::Relaxed);
+                ALIVE[1].fetch_sub(1, Ordering::Relaxed);
+                ALIVE[2].fetch_sub(size, Ordering::Relaxed);
+                SPARE_TRIMMED.fetch_add(size, Ordering::Relaxed);
+                freed.push(chunk);
+            }
+        }
+    }
     // Freed outside the lock.
     drop(freed);
 }
+
+/// (Neptune) Bytes of spare scratch chunks freed by the trim since the start.
+pub(crate) static SPARE_TRIMMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// What the host keeps for copies in the card's own memory
 /// ([`crate::shadow::cards`]): three lists of ours and the compare.
@@ -8036,7 +8076,9 @@ impl Host {
         }
     }
 
+    #[track_caller]
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let site = std::panic::Location::caller();
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -8077,7 +8119,7 @@ impl Host {
         match made {
             Ok(()) => {
                 let buffer = buffer?;
-                crate::memtel::track(&buffer, crate::memtel::UPLOAD, size);
+                crate::memtel::track(&buffer, crate::memtel::UPLOAD, size, site);
                 Some((buffer, data.cast()))
             }
             Err(e) => {
@@ -9041,7 +9083,9 @@ impl Host {
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
+    #[track_caller]
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let site = std::panic::Location::caller();
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -9085,7 +9129,7 @@ impl Host {
         match made {
             Ok(()) => {
                 let buffer = buffer?;
-                crate::memtel::track(&buffer, crate::memtel::SHARED, size);
+                crate::memtel::track(&buffer, crate::memtel::SHARED, size, site);
                 Some((buffer, data.cast()))
             }
             Err(e) => {
@@ -9116,7 +9160,9 @@ impl Host {
     /// memory is write-combined: a read is very slow); shaders and copies only read it, so it has
     /// no unordered access. Starts in the common state, from which reads promote it as they do
     /// for [`Host::shared_buffer`].
+    #[track_caller]
     pub(crate) fn gpu_upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let site = std::panic::Location::caller();
         if !self.gpu_upload_supported() {
             return None;
         }
@@ -9149,7 +9195,7 @@ impl Host {
         match made {
             Ok(()) if !data.is_null() => {
                 let buffer = buffer?;
-                crate::memtel::track(&buffer, crate::memtel::GPU_UPLOAD, size);
+                crate::memtel::track(&buffer, crate::memtel::GPU_UPLOAD, size, site);
                 Some((buffer, data.cast()))
             }
             Ok(()) => None,
@@ -9394,6 +9440,26 @@ mod trail {
 #[cfg(test)]
 mod spare {
     use super::Spare;
+
+    /// A trim frees only what stayed kept through the whole window since the last one.
+    #[test]
+    fn a_trim_frees_only_what_was_never_asked_for_since_the_last() {
+        let mut spare: Spare<u32> = Spare::new();
+        for (thing, size) in [(1, 4), (2, 4), (3, 4)] {
+            assert_eq!(spare.give(thing, size, 100), None);
+        }
+        // The first trim knows no window yet: nothing goes.
+        assert!(spare.trim().is_empty());
+        assert_eq!(spare.bytes, 12);
+        // One taken and given back: 8 bytes stayed kept all the while.
+        assert_eq!(spare.take(4), Some(3));
+        assert_eq!(spare.give(3, 4, 100), None);
+        let gone = spare.trim();
+        assert_eq!(gone.iter().map(|g| g.1).sum::<u64>(), 8);
+        assert_eq!(gone.iter().map(|g| g.0).collect::<Vec<_>>(), vec![1, 2], "the oldest go");
+        assert_eq!(spare.bytes, 4);
+        assert_eq!(spare.take(4), Some(3));
+    }
 
     /// Kept things come back by size, the last given first, and nothing is
     /// kept past the limit.

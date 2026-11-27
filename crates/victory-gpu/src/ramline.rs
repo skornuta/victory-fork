@@ -314,6 +314,9 @@ fn minute(r: &Resident) {
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mb = |v: u64| v >> 20;
+    // (Neptune) Our CPU-visible D3D12 buffers alive, by the code that asked for them.
+    let sites: Vec<String> = crate::memtel::by_site().iter().take(14).map(|(s, b, n)| format!("{s} {} MB/{n}", b >> 20)).collect();
+    tracing::info!("memory minute: our buffers by site: {}", sites.join(", "));
     let mut c = PROCESS_MEMORY_COUNTERS_EX { cb: size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32, ..Default::default() };
     // SAFETY: our own process and a sized structure (the extended form, as `cb` says).
     unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut c).cast::<PROCESS_MEMORY_COUNTERS>(), c.cb) };

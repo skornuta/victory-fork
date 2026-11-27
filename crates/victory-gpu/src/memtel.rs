@@ -26,29 +26,74 @@ pub(crate) static BUFFERS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// Counts `resource`, a buffer of `bytes` of `kind`, until D3D12 destroys it. A resource that
 /// cannot tell of its destruction is not counted at all (so nothing is counted that never
 /// goes).
-pub(crate) fn track(resource: &ID3D12Resource, kind: usize, bytes: u64) {
+pub(crate) fn track(resource: &ID3D12Resource, kind: usize, bytes: u64, site: &'static std::panic::Location<'static>) {
     let Ok(notifier) = resource.cast::<ID3DDestructionNotifier>() else {
         return;
     };
     let bytes = bytes.max(1).next_multiple_of(64 << 10);
-    // The kind in the low two bits, the bytes above: no allocation for the callback's data.
-    let data = (bytes << 2) | kind as u64;
+    let at = site_index(site);
+    // The kind in the low two bits, the site in the next eight, the bytes above: no
+    // allocation for the callback's data.
+    let data = (bytes << 10) | ((at as u64) << 2) | kind as u64;
     ALIVE[kind].fetch_add(bytes, Relaxed);
     BUFFERS[kind].fetch_add(1, Relaxed);
+    SITE_ALIVE[at].fetch_add(bytes, Relaxed);
+    SITE_BUFFERS[at].fetch_add(1, Relaxed);
     // SAFETY: a live resource; the callback takes a plain number, not a pointer to anything.
     if unsafe { notifier.RegisterDestructionCallback(Some(destroyed), data as usize as *const _) }.is_err() {
         ALIVE[kind].fetch_sub(bytes, Relaxed);
         BUFFERS[kind].fetch_sub(1, Relaxed);
+        SITE_ALIVE[at].fetch_sub(bytes, Relaxed);
+        SITE_BUFFERS[at].fetch_sub(1, Relaxed);
     }
+}
+
+/// (Neptune) The most call sites told apart; later ones share the last.
+const SITES: usize = 256;
+/// Bytes and buffers alive by the call site that asked a factory for them ([`by_site`]).
+static SITE_ALIVE: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
+static SITE_BUFFERS: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
+/// The call sites, in the order first seen.
+static SITE_NAMES: std::sync::Mutex<Vec<&'static std::panic::Location<'static>>> = std::sync::Mutex::new(Vec::new());
+
+fn site_index(site: &'static std::panic::Location<'static>) -> usize {
+    let mut names = SITE_NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(at) = names.iter().position(|s| s.file() == site.file() && s.line() == site.line()) {
+        return at;
+    }
+    if names.len() < SITES {
+        names.push(site);
+    }
+    names.len() - 1
+}
+
+/// (Neptune) For the memory minute: bytes and buffers alive by the call site that made them
+/// (`file:line`), largest first.
+pub(crate) fn by_site() -> Vec<(String, u64, u64)> {
+    let names = SITE_NAMES.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut out: Vec<_> = names
+        .iter()
+        .enumerate()
+        .map(|(at, s)| {
+            let file = s.file().rsplit(['/', '\\']).next().unwrap_or(s.file());
+            (format!("{file}:{}", s.line()), SITE_ALIVE[at].load(Relaxed), SITE_BUFFERS[at].load(Relaxed))
+        })
+        .filter(|s| s.1 > 0)
+        .collect();
+    out.sort_unstable_by_key(|s| std::cmp::Reverse(s.1));
+    out
 }
 
 /// D3D12's call as a counted buffer is destroyed (on whatever thread let it go last).
 unsafe extern "system" fn destroyed(data: *mut core::ffi::c_void) {
     let data = data as usize as u64;
     let kind = (data & 3) as usize;
+    let at = ((data >> 2) & 0xff) as usize;
     if kind < ALIVE.len() {
-        ALIVE[kind].fetch_sub(data >> 2, Relaxed);
+        ALIVE[kind].fetch_sub(data >> 10, Relaxed);
         BUFFERS[kind].fetch_sub(1, Relaxed);
+        SITE_ALIVE[at].fetch_sub(data >> 10, Relaxed);
+        SITE_BUFFERS[at].fetch_sub(1, Relaxed);
     }
 }
 
@@ -170,7 +215,7 @@ mod tests {
         let buffer = buffer.unwrap();
         // The kind no factory uses in tests running beside this one: GPU upload heaps.
         let before = ALIVE[GPU_UPLOAD].load(Relaxed);
-        track(&buffer, GPU_UPLOAD, 100_000);
+        track(&buffer, GPU_UPLOAD, 100_000, std::panic::Location::caller());
         assert_eq!(ALIVE[GPU_UPLOAD].load(Relaxed), before + (128 << 10), "rounded up to whole 64 KiB");
         let held = buffer.clone();
         drop(buffer);
