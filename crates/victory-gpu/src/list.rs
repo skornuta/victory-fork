@@ -279,7 +279,14 @@ pub(crate) static TRIMMED_LISTS: std::sync::atomic::AtomicU64 = std::sync::atomi
 #[cfg(windows)]
 fn idle_trim() -> Option<u64> {
     static S: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    *S.get_or_init(|| std::env::var("VICTORY_LIST_POOL_IDLE_S").ok().and_then(|v| v.parse().ok()).filter(|&s| s > 0))
+    // (Neptune) `VICTORY_ALLOCATOR_TRIM=1` turns it on with its own time when it is not set.
+    *S.get_or_init(|| {
+        std::env::var("VICTORY_LIST_POOL_IDLE_S")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&s| s > 0)
+            .or_else(crate::host::allocator_trim)
+    })
 }
 
 /// How many of the first of `pushed_at` (oldest first) are older than `max_age` at `now`.
