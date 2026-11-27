@@ -41,10 +41,10 @@ fn every() -> u64 {
 }
 
 /// How long none of a texture's slots may have been read before the eviction may take it
-/// (`VICTORY_BINDLESS_IDLE_S`, 45 s; 5 to 600), in milliseconds.
+/// (`VICTORY_BINDLESS_IDLE_S`, 60 s; 5 to 600), in milliseconds.
 pub(crate) fn idle_ms() -> u64 {
     static S: OnceLock<u64> = OnceLock::new();
-    *S.get_or_init(|| std::env::var("VICTORY_BINDLESS_IDLE_S").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(45).clamp(5, 600))
+    *S.get_or_init(|| std::env::var("VICTORY_BINDLESS_IDLE_S").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(60).clamp(5, 600))
         * 1000
 }
 

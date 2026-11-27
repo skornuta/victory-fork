@@ -877,6 +877,8 @@ pub(crate) fn evict_slots(resource: usize, slots: &[(usize, u32, bool)]) -> u64 
         let (Some(handle), Some(Some(host))) = (heap.handle(index), heap.host.get()) else {
             continue;
         };
+        // (Neptune) The view it shows, for the parking below: gone with the slot.
+        let key = if bindless { host.made_key(index) } else { 0 };
         if host.texture_slot_gone(index) {
             let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
             let handles = waiting.entry(resource).or_default();
@@ -887,8 +889,8 @@ pub(crate) fn evict_slots(resource: usize, slots: &[(usize, u32, bool)]) -> u64 
         }
         // (Neptune) A slot shaders pick by index (`crate::feedback`): parked, so the queue
         // does not make it again until a shader reads it.
-        if bindless {
-            host.park(index);
+        if bindless && key != 0 {
+            host.park(index, key);
         }
     }
     n

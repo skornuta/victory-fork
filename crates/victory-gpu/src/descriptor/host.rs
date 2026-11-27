@@ -582,7 +582,7 @@ pub(crate) struct TextureQueue {
     /// (Neptune) Slots whose texture the slot eviction let go while no shader read them
     /// (`crate::feedback`): never due by themselves, made again only when a shader is seen
     /// reading one ([`TextureQueue::unpark`]) or the title writes another view into it.
-    parked: std::collections::BTreeSet<u32>,
+    parked: std::collections::BTreeMap<u32, u64>,
 }
 
 impl TextureQueue {
@@ -609,16 +609,17 @@ impl TextureQueue {
         self.rechecks.remove(&index);
     }
 
-    /// (Neptune) Slot `index` lost its texture to the slot eviction: parked.
-    fn park(&mut self, index: u32) {
-        self.parked.insert(index);
+    /// (Neptune) Slot `index` lost its texture to the slot eviction while it showed the view of
+    /// key `key`: parked with it.
+    fn park(&mut self, index: u32, key: u64) {
+        self.parked.insert(index, key);
         self.rechecks.remove(&index);
     }
 
     /// (Neptune) A shader read parked slot `index` (seen in `frame`): no longer parked, and due
     /// now as one written now, so the queue makes its texture again. Whether it was parked.
     fn unpark(&mut self, index: u32, frame: u64) -> bool {
-        if !self.parked.remove(&index) {
+        if self.parked.remove(&index).is_none() {
             return false;
         }
         self.changed(index, frame, frame);
@@ -685,7 +686,7 @@ impl TextureQueue {
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
         let mut again: Vec<(u64, u32, u64)> = Vec::new();
         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
-        for (&index, w) in self.slots.iter().filter(|(i, w)| w.due <= frame && !self.parked.contains(i)) {
+        for (&index, w) in self.slots.iter().filter(|(i, w)| w.due <= frame && !self.parked.contains_key(i)) {
             let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
             class.push((w.written, index, w.write));
         }
@@ -1762,8 +1763,13 @@ impl HostHeap {
     /// keeps what it views). True if the slot was made.
     /// (Neptune) Parks title slot `index` ([`TextureQueue::park`]): its texture was let go
     /// while no shader read it.
-    pub(crate) fn park(&self, index: u32) {
-        self.textures.lock().unwrap_or_else(|e| e.into_inner()).park(index);
+    pub(crate) fn park(&self, index: u32, key: u64) {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).park(index, key);
+    }
+
+    /// (Neptune) The key of the view host slot `index` shows now (0: none).
+    pub(crate) fn made_key(&self, index: u32) -> u64 {
+        self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).copied().unwrap_or(0)
     }
 
     /// (Neptune) Of `seen` (slots a shader read, `crate::feedback`), the parked ones are due
@@ -2416,6 +2422,19 @@ impl HostHeap {
             }
             return None;
         };
+        // (Neptune) A slot parked with this very view (`crate::feedback`): the title writing it
+        // again (its records are copied about every frame) leaves it parked and null; a draw
+        // reading it through a table wants it now, and unparks it. A slot parked with another
+        // view is the title's new one: made as any other (the queue unparks it).
+        if made[index as usize] != key && !self.sampler {
+            let mut queue = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            if queue.parked.get(&index) == Some(&key) {
+                if !for_draw {
+                    return Some(view);
+                }
+                queue.parked.remove(&index);
+            }
+        }
         if made[index as usize] != key {
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
@@ -3883,7 +3902,7 @@ mod tests {
     #[test]
     fn a_parked_slot_waits_until_a_shader_reads_it() {
         let mut q = TextureQueue::default();
-        q.park(9);
+        q.park(9, 0x1_0000_0007);
         q.written(9, 10, 10, true); // the sweep puts it back in the queue
         q.changed(9, 11, 11); // its memory changed
         assert!(q.due(1_000, 99).is_empty(), "parked: not served");
@@ -3893,7 +3912,7 @@ mod tests {
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].0, 9);
         assert!(!q.unpark(9, 21), "once");
-        q.park(4);
+        q.park(4, 0x1_0000_0004);
         q.written(4, 30, 30, false); // the title wrote a view into it
         assert!(q.due(30, 99).iter().any(|&(i, _)| i == 4), "unparked by the write");
     }
