@@ -823,6 +823,7 @@ pub(crate) fn evictable_slots(
     frame: u64,
     cutoff: u64,
     fb_cutoff: Option<u64>,
+    fb_old: &std::collections::HashSet<usize>,
 ) -> (std::collections::HashMap<usize, Vec<(usize, u32, bool)>>, u64, u64) {
     let set: std::collections::HashSet<usize> = raws.keys().copied().collect();
     let heaps: Vec<usize> = SHADER_HEAPS
@@ -840,6 +841,9 @@ pub(crate) fn evictable_slots(
             continue;
         };
         for (index, raw, ok, lately, bindless) in host.slots_showing(&set, frame, cutoff, fb_cutoff) {
+            // (Neptune) The feedback's way only for copies that lived its whole idle time.
+            let fresh = bindless && !fb_old.contains(&raw);
+            let (ok, bindless) = (ok && !fresh, bindless && !fresh);
             if lately {
                 seen.insert(raw);
             }

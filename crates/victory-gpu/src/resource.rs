@@ -2196,6 +2196,7 @@ fn slot_evict(video: Option<[u64; 4]>, idle_ms: u64, frames: u64) {
     };
     let mut copies = Vec::new();
     let mut raws = std::collections::HashMap::new();
+    let mut fb_old = std::collections::HashSet::new();
     for &at in textures().iter() {
         // SAFETY: as in `pressure_victims`.
         let r = unsafe { &*(at as *const Resource) };
@@ -2211,14 +2212,23 @@ fn slot_evict(video: Option<[u64; 4]>, idle_ms: u64, frames: u64) {
             let stamp = r.host.used.load(Relaxed);
             if crate::host::long_ago(stamp, idle_ms, frames) && std::sync::Arc::strong_count(host) == 1 {
                 copies.push((at, stamp, host.bytes));
-                raws.insert(windows::core::Interface::as_raw(&host.texture) as usize, at);
+                let raw = windows::core::Interface::as_raw(&host.texture) as usize;
+                raws.insert(raw, at);
+                // (Neptune) Bindless: only a copy made (or last asked for) the feedback's whole
+                // idle time ago. One made since may not have been drawn yet (the world's
+                // textures stream in ahead of the frames that show them): never read is not
+                // idle. A first run let go of such copies as they arrived, and 457 came back
+                // within 2 s.
+                if fb_cutoff.is_some() && crate::host::long_ago(stamp, crate::feedback::idle_ms(), frames) {
+                    fb_old.insert(raw);
+                }
             }
         }
     }
     if copies.is_empty() {
         return;
     }
-    let (slots, kept, blocked) = crate::descriptor::evictable_slots(&raws, frame, cutoff, fb_cutoff);
+    let (slots, kept, blocked) = crate::descriptor::evictable_slots(&raws, frame, cutoff, fb_cutoff, &fb_old);
     SLOT_STATE[3].store(raws.len() as u64, Relaxed);
     SLOT_STATE[2].store(blocked, Relaxed);
     SLOT_STATE[1].store(kept, Relaxed);
