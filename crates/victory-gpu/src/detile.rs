@@ -626,9 +626,10 @@ fn fit(state: &mut State, completed: u64) {
             let old_out = std::mem::replace(&mut state.out, (out, out_gpu));
             state.raw_arena = Arena::new(want.0);
             state.out_arena = Arena::new(out_size);
-            if grow {
-                // The card's ring may come back smaller than asked (no room): that is full now.
-                state.full.1 = out_size;
+            if grow && out_size < want.1 {
+                // The card had no room for the whole ring: tried again in ten seconds; the full
+                // size stays what was asked.
+                state.tried_ms = now + 9_000;
             }
             crate::host::retire((old_raw.0, old_out.0));
             RESIZES[usize::from(grow)].fetch_add(1, Relaxed);
