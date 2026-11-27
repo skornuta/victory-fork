@@ -101,7 +101,11 @@ fn translate(native: &NativeProgram) -> HostShader {
 /// indices 0 and 1, on the hardware GPU and on WARP (each skipped without a device), and
 /// returns per one that ran the UAV's dwords.
 fn run(shader: &HostShader, s0: u32, texture: View) -> Vec<(&'static str, Vec<u32>)> {
-    let views = [texture, View::RawUav(4)];
+    run_views(shader, s0, &[texture, View::RawUav(4)]).into_iter().map(|(label, words)| (label, words[0].clone())).collect()
+}
+
+/// [`run`] with any views at heap indices 0 on; every UAV's dwords, in order, per device.
+fn run_views(shader: &HostShader, s0: u32, views: &[View]) -> Vec<(&'static str, Vec<Vec<u32>>)> {
     let mut out = Vec::new();
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
@@ -128,13 +132,13 @@ fn run(shader: &HostShader, s0: u32, texture: View) -> Vec<(&'static str, Vec<u3
                 &pso,
                 &Dispatch {
                     roots: vec![(0, Root::Constants(ud))],
-                    views: &views,
+                    views,
                     samplers: &[],
                     groups: [1, 1, 1],
                 },
             )
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-        out.push((label, words[0].clone()));
+        out.push((label, words));
     }
     out
 }
@@ -228,5 +232,39 @@ fn a_sampler_each_arm_of_a_uniform_branch_sets_samples_as_that_arm_says() {
         for (label, words) in run(&shader, s0, View::Texture(2, 1, &texels)) {
             assert_eq!(f32::from_bits(words[0]), red, "{label}, s0 = {s0}");
         }
+    }
+}
+
+/// (Neptune) Bindless usage feedback: with a feedback slot, a texture taken from the view heap
+/// stores 1 into dword `index` of the raw buffer at that slot, in a container `dxil.dll`
+/// accepts; the program's own work is unchanged.
+#[test]
+fn a_texture_taken_from_the_heap_is_noted_in_the_feedback_buffer() {
+    let program = native(&[
+        0xBE94_0380, // s_mov_b32 s20, 0
+        0xBE95_03FF,
+        0x00C0_0000, // s_mov_b32 s21, 0x00c00000 (levels up to 12)
+        0xBE96_0380, // s_mov_b32 s22, 0 (point filtering)
+        0xBE97_0380, // s_mov_b32 s23, 0
+        0x7E02_02FF,
+        0x3E80_0000, // v_mov_b32 v1, 0.25
+        0x7E04_02FF,
+        0x3F00_0000, // v_mov_b32 v2, 0.5
+        0xF09C_0F08,
+        0x00A2_0301, // image_sample_lz v[3:6], v[1:2], s[8:15], s[20:23] dmask:0xf 2D
+        0xE070_0000,
+        0x8004_0300, // buffer_store_dword v3, off, s[16:19], 0
+    ]);
+    // The feedback buffer at heap slot 2, for this thread's translation only.
+    super::shader::FEEDBACK_TEST.with(|f| f.set(Some(2)));
+    let shader = translate(&program);
+    super::shader::FEEDBACK_TEST.with(|f| f.set(None));
+    let plain = translate(&program);
+    assert_ne!(shader.dxil, plain.dxil, "the feedback store is in the translation");
+    let texels = [[3.0f32, 0.0, 0.0, 1.0], [5.0, 0.0, 0.0, 1.0]];
+    for (label, uavs) in run_views(&shader, 0, &[View::Texture(2, 1, &texels), View::RawUav(4), View::RawUav(4)]) {
+        assert_eq!(f32::from_bits(uavs[0][0]), 3.0, "{label}: the sample as without feedback");
+        // Slot 0 (the texture) noted; slot 1 (a raw buffer, not a texture) not.
+        assert_eq!(uavs[1], [1, 0, 0, 0], "{label}: the feedback buffer");
     }
 }

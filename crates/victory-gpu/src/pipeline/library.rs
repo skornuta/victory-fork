@@ -204,8 +204,8 @@ impl Blob {
     /// The library file in `dir`: a library a save left beside it
     /// ([`NEXT_FILE`]) takes its place first.
     fn of(dir: &std::path::Path) -> Blob {
-        let path = dir.join(LIBRARY_FILE);
-        let next = dir.join(NEXT_FILE);
+        let path = dir.join(library_file());
+        let next = dir.join(next_file());
         if next.exists() && std::fs::rename(&next, &path).is_err() {
             tracing::warn!("the host pipeline library saved last could not take the old one's place");
         }
@@ -434,6 +434,24 @@ const LIBRARY_FILE: &str = "host-pipelines.bin";
 /// start renames it over the library first ([`Blob::of`]).
 const NEXT_FILE: &str = "host-pipelines.next";
 const EARLY_FILE: &str = "early-pipelines.txt";
+
+/// (Neptune) The library's files: with bindless usage feedback (`crate::feedback`) every
+/// shader that takes a texture from the heap is another, so those runs keep a library of
+/// their own (`host-pipelines-feedback.bin`, `.next`, `early-pipelines-feedback.txt`) and
+/// never read, replace or trim the usual one.
+fn library_file() -> &'static str {
+    if crate::feedback::on() { "host-pipelines-feedback.bin" } else { LIBRARY_FILE }
+}
+
+/// See [`library_file`] and [`NEXT_FILE`].
+fn next_file() -> &'static str {
+    if crate::feedback::on() { "host-pipelines-feedback.next" } else { NEXT_FILE }
+}
+
+/// See [`library_file`] and [`EARLY_FILE`].
+fn early_file() -> &'static str {
+    if crate::feedback::on() { "early-pipelines-feedback.txt" } else { EARLY_FILE }
+}
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
 
@@ -581,7 +599,7 @@ pub(crate) fn save(now: bool) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
-    let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
+    let tmp = dir.join(library_file()).with_extension("tmp");
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
@@ -617,7 +635,7 @@ pub(crate) fn save(now: bool) {
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
-        let in_place = !dir.join(NEXT_FILE).exists();
+        let in_place = !dir.join(next_file()).exists();
         if in_place && VIEW[0].load(Ordering::Relaxed) != 0 {
             REPLACED[1].store(crate::host::now_ms(), Ordering::Relaxed);
             REPLACED[0].fetch_add(1, Ordering::Relaxed);
@@ -630,7 +648,7 @@ pub(crate) fn save(now: bool) {
         });
     }
     let written = library_written
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+        .and_then(|()| write_atomically(&dir.join(early_file()), used.join("\n").as_bytes()));
     match written {
         Ok(()) => tracing::info!(
             bytes,
@@ -670,7 +688,7 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
 /// stay: the rest read as zeros). Where a system refuses, the new library
 /// is left beside it as [`NEXT_FILE`] for the next start.
 fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
-    std::fs::rename(tmp, dir.join(LIBRARY_FILE)).or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
+    std::fs::rename(tmp, dir.join(library_file())).or_else(|_| std::fs::rename(tmp, dir.join(next_file())))
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
@@ -690,7 +708,7 @@ fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
     if used.is_none() {
         let listed = DIR
             .get()
-            .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
+            .and_then(|d| std::fs::read_to_string(d.join(early_file())).ok())
             .unwrap_or_default();
         let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
         tracing::info!(pipelines = set.len(), "title pipelines to start early");
@@ -746,7 +764,7 @@ mod tests {
     #[test]
     fn the_library_file_is_mapped_and_replaced() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(LIBRARY_FILE);
+        let path = dir.path().join(library_file());
         assert!(matches!(Blob::of(dir.path()), Blob::None), "no file yet");
         std::fs::write(&path, b"").unwrap();
         assert!(matches!(Blob::of(dir.path()), Blob::None), "an empty file");
@@ -770,7 +788,7 @@ mod tests {
         drop(blob);
         // The next start reads the new one, wherever the save left it.
         assert_eq!(Blob::of(dir.path()).bytes(), &new[..]);
-        assert!(!dir.path().join(NEXT_FILE).exists());
+        assert!(!dir.path().join(next_file()).exists());
     }
 
     /// The bytes at `at` of the pattern the test below writes.
@@ -822,7 +840,7 @@ mod tests {
     fn a_replaced_library_file_still_reads_from_the_disk() {
         const LEN: usize = 8 << 20;
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(LIBRARY_FILE);
+        let path = dir.path().join(library_file());
         if !write_uncached(&path, LEN) {
             return; // no uncached writes here: nothing to show
         }

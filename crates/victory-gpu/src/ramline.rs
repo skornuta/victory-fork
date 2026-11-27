@@ -301,7 +301,7 @@ rust_heap,d3d12_upload,d3d12_shared,d3d12_gpu_upload,d3d12_ours_unranged,sysmem_
 other_private,other_private_res,other_mapped,unattributed_private,\
 host_lists,preludes_made,idle_lists,list_scratch,\
 card_copies,tex_filled,tex_filled_placed,tex_targets,tex_depth,tex_uav,tex_twins,tex_idle_held,\
-detile_raw_used,detile_card_used,detile_raw_size,detile_card_size,detile_to_cpu,vram_commit_backing,residual_private,slot_evicted,slot_evicted_mb,slot_slots_reset,slot_came_back,slot_came_back_2s,slot_given_up,slot_evicting,slot_candidates,slot_kept_seen,slot_blocked";
+detile_raw_used,detile_card_used,detile_raw_size,detile_card_size,detile_to_cpu,vram_commit_backing,residual_private,slot_evicted,slot_evicted_mb,slot_slots_reset,slot_came_back,slot_came_back_2s,slot_given_up,slot_evicting,slot_candidates,slot_kept_seen,slot_blocked,fb_copies,fb_parked,fb_unparked";
 
 /// (Neptune) Once a minute, from the resident sampler's thread: one row of the memory
 /// breakdown into the memory CSV, and the same derived in one log line. What we track (title
@@ -403,6 +403,9 @@ fn minute(r: &Resident) {
         crate::resource::SLOT_STATE[3].load(Relaxed),
         crate::resource::SLOT_STATE[1].load(Relaxed),
         crate::resource::SLOT_STATE[2].load(Relaxed),
+        crate::feedback::STATS[0].load(Relaxed),
+        crate::descriptor::parked(),
+        crate::feedback::STATS[2].load(Relaxed),
     ];
     tracing::info!(
         "memory minute: private {} MB (peak {} MB), working set {} MB, PC free {} MB, system commit {} of {} MB; \

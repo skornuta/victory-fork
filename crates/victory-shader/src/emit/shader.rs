@@ -81,6 +81,8 @@ pub(crate) mod flags {
     pub const DOUBLES: u64 = 1 << 2;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
+    /// (Neptune) UAV access outside pixel and compute shaders (the feedback store).
+    pub const UAVS_AT_EVERY_STAGE: u64 = 1 << 16;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const ROVS: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
@@ -137,6 +139,45 @@ pub fn view_heap_limit() -> u32 {
     VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// (Neptune) Bindless usage feedback (`VICTORY_BINDLESS_FEEDBACK=1` on the host): every texture
+/// a shader takes from the view heap stores 1 into dword `index` of a raw buffer the host keeps
+/// at [`feedback_slot`], the slot below the null slot. The host reads it back and clears it every
+/// few frames, and so knows which slots shaders picked by index read: a texture only such slots
+/// show can be let go when none of them was read for a while. A plain store, not an atomic:
+/// every lane stores the same value, so there is nothing to read-modify-write, no contention
+/// and no branch (the handle helpers here emit into the caller's block and cannot branch).
+static FEEDBACK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// See [`FEEDBACK`]. Set before the first shader is translated: a shader keeps what it was
+/// translated with (the translation fingerprint has it).
+pub fn set_bindless_feedback(on: bool) {
+    FEEDBACK.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// See [`FEEDBACK`].
+pub fn bindless_feedback() -> bool {
+    FEEDBACK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: the feedback slot for translations on this thread (the globals stay alone, so
+    /// tests translating beside it are not changed).
+    pub(crate) static FEEDBACK_TEST: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// The view heap slot of the feedback buffer ([`FEEDBACK`]), if shaders translated now store to
+/// one: the slot below the null slot ([`VIEW_LIMIT`]), which the host keeps out of its dynamic
+/// slots.
+pub fn feedback_slot() -> Option<u32> {
+    #[cfg(test)]
+    if let Some(slot) = FEEDBACK_TEST.with(std::cell::Cell::get) {
+        return Some(slot);
+    }
+    let limit = view_heap_limit();
+    (bindless_feedback() && limit > 1).then(|| limit - 1)
+}
+
 pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,
@@ -176,6 +217,11 @@ pub(crate) struct Shader {
     lds: Option<V>,
     main: V,
     pub entry: usize,
+    /// (Neptune) The feedback buffer's handle ([`FEEDBACK`]), made in the entry block once.
+    feedback: Option<V>,
+    /// Whether the shader stores to it (a stage other than pixel and compute then declares UAVs
+    /// at every stage).
+    feedback_stores: bool,
 }
 
 impl Shader {
@@ -230,7 +276,35 @@ impl Shader {
             lds: None,
             main,
             entry,
+            feedback: None,
+            feedback_stores: false,
         }
+    }
+
+    /// (Neptune) [`FEEDBACK`]: stores 1 into dword `index` of the feedback buffer at `slot`.
+    fn feedback_store(&mut self, block: usize, index: V, slot: u32) {
+        let h = match self.feedback {
+            Some(h) => h,
+            None => {
+                let s = self.m.i32(slot);
+                let (no, uniform) = (self.m.bool(false), self.m.bool(false));
+                let entry = self.entry;
+                let h = self.op(entry, "createHandleFromHeap", Attr::ReadNone, self.t.handle, 218, &[s, no, uniform]);
+                let h = self.annotate(entry, h, 11 | 0x1000, 0);
+                self.flags |= flags::RESOURCE_HEAP;
+                self.feedback = Some(h);
+                h
+            }
+        };
+        let two = self.m.i32(2);
+        let byte = self.m.bin(block, super::bitcode::Bin::Shl, index, two);
+        let one = self.m.i32(1);
+        let iu = self.m.undef(self.t.i32);
+        let mask = self.m.i8(1);
+        let align = self.m.i32(4);
+        let void = self.t.void;
+        self.op(block, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &[h, byte, iu, one, iu, iu, iu, mask, align]);
+        self.feedback_stores = true;
     }
 
     /// The thread-group shared memory: `[lds_dwords x i32]` in address
@@ -448,6 +522,14 @@ impl Shader {
         } else {
             props
         };
+        // (Neptune) A texture of the view heap (resource kinds 1-9, read or written): noted in
+        // the feedback buffer, at its clamped index.
+        if !sampler
+            && (1..=9).contains(&(props.0 & 0xff))
+            && let Some(slot) = feedback_slot()
+        {
+            self.feedback_store(block, index, slot);
+        }
         self.nonuniform_handles += u32::from(nonuniform);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
@@ -463,6 +545,11 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        // (Neptune) The feedback store from a stage other than pixel and compute.
+        let compute = self.threads.is_some() && self.mesh.is_none();
+        if self.feedback_stores && !self.pixel && !compute {
+            self.flags |= flags::UAVS_AT_EVERY_STAGE;
+        }
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         // The clean-up, before anything is declared about the code: a
@@ -800,6 +887,9 @@ impl Shader {
         let mut features = 0u64;
         if self.flags & flags::DOUBLES != 0 {
             features |= 0x1;
+        }
+        if self.flags & flags::UAVS_AT_EVERY_STAGE != 0 {
+            features |= 0x4;
         }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;

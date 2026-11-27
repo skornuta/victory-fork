@@ -822,7 +822,8 @@ pub(crate) fn evictable_slots(
     raws: &std::collections::HashMap<usize, usize>,
     frame: u64,
     cutoff: u64,
-) -> (std::collections::HashMap<usize, Vec<(usize, u32)>>, u64, u64) {
+    fb_cutoff: Option<u64>,
+) -> (std::collections::HashMap<usize, Vec<(usize, u32, bool)>>, u64, u64) {
     let set: std::collections::HashSet<usize> = raws.keys().copied().collect();
     let heaps: Vec<usize> = SHADER_HEAPS
         .lock()
@@ -830,7 +831,7 @@ pub(crate) fn evictable_slots(
         .iter()
         .map(|&(_, _, h)| h)
         .collect();
-    let mut by_texture: std::collections::HashMap<usize, Vec<(usize, u32)>> = std::collections::HashMap::new();
+    let mut by_texture: std::collections::HashMap<usize, Vec<(usize, u32, bool)>> = std::collections::HashMap::new();
     let mut blocked = std::collections::HashSet::new();
     let mut seen = std::collections::HashSet::new();
     for at in heaps {
@@ -838,12 +839,12 @@ pub(crate) fn evictable_slots(
         let Some(Some(host)) = unsafe { &*(at as *const Heap) }.host.get() else {
             continue;
         };
-        for (index, raw, ok, lately) in host.slots_showing(&set, frame, cutoff) {
+        for (index, raw, ok, lately, bindless) in host.slots_showing(&set, frame, cutoff, fb_cutoff) {
             if lately {
                 seen.insert(raw);
             }
             if ok {
-                by_texture.entry(raw).or_default().push((at, index));
+                by_texture.entry(raw).or_default().push((at, index, bindless));
             } else {
                 blocked.insert(raw);
             }
@@ -859,9 +860,9 @@ pub(crate) fn evictable_slots(
 /// (`make_waiting`) or by the draw that reads them. Returns how many were
 /// made. Called before the host copy is let go.
 #[cfg(windows)]
-pub(crate) fn evict_slots(resource: usize, slots: &[(usize, u32)]) -> u64 {
+pub(crate) fn evict_slots(resource: usize, slots: &[(usize, u32, bool)]) -> u64 {
     let mut n = 0;
-    for &(at, index) in slots {
+    for &(at, index, bindless) in slots {
         let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
         if !heaps.iter().any(|&(_, _, h)| h == at) {
             continue;
@@ -880,8 +881,40 @@ pub(crate) fn evict_slots(resource: usize, slots: &[(usize, u32)]) -> u64 {
             }
             n += 1;
         }
+        // (Neptune) A slot shaders pick by index (`crate::feedback`): parked, so the queue
+        // does not make it again until a shader reads it.
+        if bindless {
+            host.park(index);
+        }
     }
     n
+}
+
+/// (Neptune) Of `seen` (view heap slots a shader read, `crate::feedback`), the parked ones of
+/// every shader-visible view heap are due again. Returns how many.
+#[cfg(windows)]
+pub(crate) fn unpark_seen(seen: &[u32]) -> u64 {
+    let frame = crate::frame::current();
+    let heaps: Vec<usize> = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|&(_, _, h)| h).collect();
+    let mut n = 0;
+    for at in heaps {
+        // SAFETY: registered heaps are live (removed when dropped).
+        if let Some(Some(host)) = unsafe { &*(at as *const Heap) }.host.get() {
+            n += host.unpark_seen(seen, frame);
+        }
+    }
+    n
+}
+
+/// (Neptune) Slots parked now, over every shader-visible view heap.
+#[cfg(windows)]
+pub(crate) fn parked() -> u64 {
+    let heaps: Vec<usize> = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|&(_, _, h)| h).collect();
+    heaps
+        .into_iter()
+        // SAFETY: registered heaps are live (removed when dropped).
+        .filter_map(|at| unsafe { &*(at as *const Heap) }.host.get().and_then(Option::as_ref).map(|h| h.parked()))
+        .sum()
 }
 
 /// Makes the host slots that waited for a texture's host copy, for the

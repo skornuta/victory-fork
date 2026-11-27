@@ -2161,7 +2161,7 @@ fn slot_evict(video: Option<[u64; 4]>, idle_ms: u64, frames: u64) {
     let (Some((high, low, cap)), Some([budget, used, ..])) = (slot_evict_settings(), video) else {
         return;
     };
-    // (Neptune) Frames by time, a point a sweep (once a second), two minutes of them: what
+    // (Neptune) Frames by time, a point a sweep (once a second), twelve minutes of them: what
     // frame "`idle_ms` ago" was, for the slots' table stamps, which count frames.
     static RING: std::sync::Mutex<std::collections::VecDeque<(u64, u64)>> = std::sync::Mutex::new(std::collections::VecDeque::new());
     let now_ms = crate::host::now_ms();
@@ -2169,11 +2169,20 @@ fn slot_evict(video: Option<[u64; 4]>, idle_ms: u64, frames: u64) {
     let cutoff = {
         let mut ring = RING.lock().unwrap_or_else(|e| e.into_inner());
         ring.push_back((frame, now_ms));
-        while ring.len() > 120 {
+        while ring.len() > 720 {
             ring.pop_front();
         }
-        frame_at(&ring, now_ms.saturating_sub(idle_ms))
+        (
+            frame_at(&ring, now_ms.saturating_sub(idle_ms)),
+            // (Neptune) Bindless usage feedback: the frame its own, longer idle time back, if
+            // the feedback has watched every frame since (`crate::feedback::covers`).
+            crate::feedback::on()
+                .then(|| frame_at(&ring, now_ms.saturating_sub(crate::feedback::idle_ms())))
+                .flatten()
+                .filter(|&c| crate::feedback::covers(c)),
+        )
     };
+    let (cutoff, fb_cutoff) = cutoff;
     static EVICTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let (on, need) = slot_plan(EVICTING.load(Relaxed), budget, used, high, low, cap);
     EVICTING.store(on, Relaxed);
@@ -2209,7 +2218,7 @@ fn slot_evict(video: Option<[u64; 4]>, idle_ms: u64, frames: u64) {
     if copies.is_empty() {
         return;
     }
-    let (slots, kept, blocked) = crate::descriptor::evictable_slots(&raws, frame, cutoff);
+    let (slots, kept, blocked) = crate::descriptor::evictable_slots(&raws, frame, cutoff, fb_cutoff);
     SLOT_STATE[3].store(raws.len() as u64, Relaxed);
     SLOT_STATE[2].store(blocked, Relaxed);
     SLOT_STATE[1].store(kept, Relaxed);

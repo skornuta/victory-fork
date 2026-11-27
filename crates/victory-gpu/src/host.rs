@@ -6049,6 +6049,15 @@ impl Host {
                 *first += 1;
             }
         }
+        // (Neptune) Bindless usage feedback (`crate::feedback`): its copy and clear, first.
+        if crate::feedback::on()
+            && let Some(pre) = crate::feedback::pre_list()
+        {
+            lists.insert(0, Some(pre));
+            for first in firsts.iter_mut().skip(1) {
+                *first += 1;
+            }
+        }
         crate::watch::ask_once_end();
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
@@ -6081,6 +6090,9 @@ impl Host {
                 self.queue.ExecuteCommandLists(&lists);
                 self.queue.Signal(&self.fence, *submitted)
             };
+            if crate::feedback::on() {
+                crate::feedback::sent(*submitted);
+            }
             if crate::detile::on() {
                 crate::detile::sent(*submitted);
             }
@@ -6165,6 +6177,9 @@ impl Host {
             let _ = (i, started);
         }
         // (Neptune) The last group's value: every group of this submission is behind it.
+        if crate::feedback::on() {
+            crate::feedback::sent(*submitted);
+        }
         if crate::detile::on() {
             crate::detile::sent(*submitted);
         }
