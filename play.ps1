@@ -92,6 +92,7 @@ $set = [ordered]@{
   VICTORY_SLOT_EVICT_LOW_PERCENT = '65'
   VICTORY_BINDLESS_FEEDBACK   = '1'         # shaders note the textures they take from the heap, so unseen ones can go too
   VICTORY_ALLOCATOR_TRIM      = '1'         # command allocators taken anew every 30 s (they keep their largest recording)
+  VICTORY_STAGE_POOL_MB       = '64'        # spare texture staging buffers kept (256 by default; the world uses about 25 MB)
 }
 if (-not $NoAutoA) { $set['VICTORY_AUTO_A'] = '150' }   # taps A through the start screens for 150 s
 if ($FrametimeDump) { $set['VICTORY_FRAMETIME_DUMP'] = '1' }
