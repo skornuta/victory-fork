@@ -81,6 +81,17 @@ $set = [ordered]@{
   VICTORY_DESC_DATA           = '1'         # shaders that read a descriptor as data translate (5 more in the first scenes)
   VICTORY_VRAM_IDLE_MS        = '15000,2500,1000'   # an unused texture is kept 15 s while the card has room (less black-then-back)
   VICTORY_PIPELINE_WAIT_MS    = '2500'      # a frame waits at most 2.5 s for a shader being compiled (12 s by default: freezes, and the game's own watchdog ends a 30 s frame)
+  # Memory (RTX 5080 runs of 2026-11-26: VRAM 12.6 -> 9.5 GB, private 26.0 -> 22.6 GB in the first area, no pop-in seen)
+  VICTORY_GPU_DETILE          = '1'         # textures are detiled on the card
+  VICTORY_GPU_DETILE_VERIFY   = '0'
+  VICTORY_GPU_DETILE_OUT_MB   = '512'       # detile rings for loading bursts...
+  VICTORY_GPU_DETILE_RAW_MB   = '512'
+  VICTORY_GPU_DETILE_TRIM     = '1'         # ...shrunk to 64 + 64 MB once loading is over, grown back for a burst
+  VICTORY_SLOT_EVICT          = '1'         # idle textures' card copies let go above 75 % of the card's budget, down to 65 %
+  VICTORY_SLOT_EVICT_PERCENT  = '75'
+  VICTORY_SLOT_EVICT_LOW_PERCENT = '65'
+  VICTORY_BINDLESS_FEEDBACK   = '1'         # shaders note the textures they take from the heap, so unseen ones can go too
+  VICTORY_ALLOCATOR_TRIM      = '1'         # command allocators taken anew every 30 s (they keep their largest recording)
 }
 if (-not $NoAutoA) { $set['VICTORY_AUTO_A'] = '150' }   # taps A through the start screens for 150 s
 if ($FrametimeDump) { $set['VICTORY_FRAMETIME_DUMP'] = '1' }
