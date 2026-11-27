@@ -1931,11 +1931,34 @@ fn extend_runs(run: &mut Option<(usize, usize)>, done: &mut Vec<(usize, usize)>,
     }
 }
 
+/// (Neptune) The piece a refresh with [`copy_changed`] compares at a time (a multiple of
+/// [`changed_spans`]' 256-byte step), with [`compare_pieces`].
+const COMPARE_PIECE: usize = 1 << 20;
+
+/// (Neptune) Whether refreshes with [`copy_changed`] compare in pieces of [`COMPARE_PIECE`]
+/// (`VICTORY_COMPARE_PIECES=1`; off by default) rather than whole, through a buffer as large
+/// as the range.
+fn compare_pieces() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COMPARE_PIECES").is_some_and(|v| v == "1"))
+}
+
+/// (Neptune) Adds `run` (after every run in `runs`) as [`changed_spans`] would have: joined
+/// to the last run when less than 1 KiB after it.
+fn join_spans(runs: &mut Vec<(usize, usize)>, run: (usize, usize)) {
+    match runs.last_mut() {
+        Some(last) if run.0 <= last.0 + last.1 + SPAN_JOIN => last.1 = run.0 + run.1 - last.0,
+        _ => runs.push(run),
+    }
+}
+
+const SPAN_JOIN: usize = 1024;
+
 /// Where `now` differs from `was`, as runs (offset, bytes) in steps of 256 bytes; runs
 /// less than 1 KiB apart are one.
 fn changed_spans(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     const STEP: usize = 256;
-    const JOIN: usize = 1024;
+    const JOIN: usize = SPAN_JOIN;
     let n = now.len().min(was.len());
     let mut runs: Vec<(usize, usize)> = Vec::new();
     if now[..n] == was[..n] {
@@ -2023,6 +2046,47 @@ fn widen_to_words(address: usize, n: usize, runs: Vec<(usize, usize)>) -> Vec<(u
         }
     }
     out
+}
+
+#[cfg(test)]
+mod compare_piece_tests {
+    use super::{changed_spans, join_spans};
+
+    /// The spans of a compare in pieces, joined, are those of one compare of the whole: also
+    /// for changes that cross a piece's edge, end just before it, or lie less than 1 KiB apart
+    /// across it.
+    #[test]
+    fn spans_compared_in_pieces_are_those_of_the_whole() {
+        let n = 64 << 10;
+        let was = vec![7u8; n];
+        let piece = 4096;
+        // (first byte changed, bytes changed) per case, around the edges at 4096 and 8192.
+        let cases: &[&[(usize, usize)]] = &[
+            &[(4000, 200)],
+            &[(3800, 10), (4400, 10)],
+            &[(4095, 1), (4096, 1)],
+            &[(100, 1), (8191, 2), (9300, 5)],
+            &[(0, n)],
+            &[(4096 - 256, 256), (4096 + 1024 + 256, 1)],
+            &[],
+        ];
+        for changes in cases {
+            let mut now = was.clone();
+            for &(a, m) in *changes {
+                for b in &mut now[a..a + m] {
+                    *b = 9;
+                }
+            }
+            let whole = changed_spans(&now, &was);
+            let mut pieced = Vec::new();
+            for at in (0..n).step_by(piece) {
+                for (r, m) in changed_spans(&now[at..at + piece], &was[at..at + piece]) {
+                    join_spans(&mut pieced, (at + r, m));
+                }
+            }
+            assert_eq!(pieced, whole, "changes {changes:?}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3470,16 +3534,31 @@ impl Shadow {
             }
             TITLE.with(|title| {
                 let mut title = title.borrow_mut();
-                // What a read that fails leaves alone stays as the copy has it.
-                title.clear();
-                title.extend_from_slice(held);
-                crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, n, false);
-                let runs = changed_spans(&title, held);
-                COPY_CHANGED[0].fetch_add(n as u64, Ordering::Relaxed);
-                for &(r, m) in &runs {
-                    held[r..r + m].copy_from_slice(&title[r..r + m]);
-                    COPY_CHANGED[1].fetch_add(m as u64, Ordering::Relaxed);
+                // (Neptune) In pieces of [`COMPARE_PIECE`] through one buffer of that size: a
+                // thread kept a buffer as large as the largest range it ever compared (12
+                // refreshing threads, ~270 MB in the first area). The runs come out as from one
+                // compare of the whole (`join_spans`).
+                let piece = if compare_pieces() { COMPARE_PIECE } else { n };
+                let mut runs: Vec<(usize, usize)> = Vec::new();
+                let mut at = 0;
+                while at < n {
+                    let len = piece.min(n - at);
+                    let held = &mut held[at..at + len];
+                    // What a read that fails leaves alone stays as the copy has it.
+                    title.clear();
+                    title.extend_from_slice(held);
+                    crate::host::copy_mapped(title.as_mut_ptr(), (from + at) as *const u8, len, false);
+                    for (r, m) in changed_spans(&title, held) {
+                        held[r..r + m].copy_from_slice(&title[r..r + m]);
+                        COPY_CHANGED[1].fetch_add(m as u64, Ordering::Relaxed);
+                        join_spans(&mut runs, (at + r, m));
+                    }
+                    at += len;
                 }
+                if compare_pieces() && title.capacity() > COMPARE_PIECE {
+                    *title = Vec::new();
+                }
+                COPY_CHANGED[0].fetch_add(n as u64, Ordering::Relaxed);
                 if let (Some(first), Some(last)) = (runs.first(), runs.last()) {
                     self.changed(from - start + first.0, from - start + last.0 + last.1);
                     self.card_changed_runs(from - start, &runs);
