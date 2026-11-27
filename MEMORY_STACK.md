@@ -59,7 +59,7 @@ d8a3df8 49dd4c7 0ab9ab8 f879d92 df8839d 6497c6e 406ff5f 3599b52 7c274de 9c0c61b
 | Launcher | `be0f84c` `66cee8f` `98a4e60` `0c78932` `efe723a` | `play.ps1` only |
 | Optional | `49dd4c7` `3599b52` | test target compile fix; hang watch (`VICTORY_HANG_WATCH_S`, a diagnostic) |
 
-The patches also apply with `git am` (series `0001` to `0026`; `0022` and `0026` only touch this file).
+The patches also apply with `git am` (series `0001` to `0027`; `0022` and `0026` only touch this file, `0027` adds `AGENTS.md`). For AI coding agents, or a fork that has moved away from `e94251a`: [AGENTS.md](AGENTS.md).
 
 ## Left out on purpose
 
