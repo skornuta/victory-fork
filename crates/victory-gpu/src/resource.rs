@@ -1210,6 +1210,9 @@ struct Hosted {
     /// that (0: never).
     slot_evicted: std::sync::atomic::AtomicU64,
     slot_returned: std::sync::atomic::AtomicU64,
+    /// (Neptune) The frame (plus one) the eviction let it go while no shader read any of its
+    /// slots (`crate::feedback`); 0: not, or made again since.
+    fb_evicted: std::sync::atomic::AtomicU64,
 }
 
 /// Counts for the memory line: host copies of textures the title fills
@@ -1441,6 +1444,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // Slots the title wrote with views of it while it had no host copy
         // are made before the next submission runs.
         crate::descriptor::texture_made(this as usize);
+        r.host.fb_evicted.store(0, Relaxed);
         let evicted = r.host.slot_evicted.swap(0, Relaxed);
         if evicted != 0 {
             let now = crate::host::moment();
@@ -1448,10 +1452,67 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             SLOT_EVICT[4].fetch_add(u64::from(!crate::host::long_ago(evicted, FAST_BACK_MS, 0)), Relaxed);
             SLOT_EVICT[5].fetch_add(now.wrapping_sub(evicted) & 0xffff_ffff, Relaxed);
             r.host.slot_returned.store(now.max(1), Relaxed);
+            note_remake();
         }
     }
     r.host.used.store(crate::host::moment(), Relaxed);
     made.clone()
+}
+
+/// (Neptune) If title texture `this` was let go by the slot eviction while no shader read any of
+/// its slots (`crate::feedback`) and has not been made since: the frame it went.
+#[cfg(windows)]
+pub(crate) fn unread_evicted(this: This) -> Option<u64> {
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    match r.host.fb_evicted.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        f => Some(f - 1),
+    }
+}
+
+/// (Neptune) Copies the slot eviction let go that were made again, by the call path that made
+/// them: the return addresses above `hosted`, as offsets in this executable (0: another
+/// module), with how many. For finding what brings evicted textures back (the memory minute
+/// lists the most common).
+static REMADE: std::sync::Mutex<Option<std::collections::HashMap<[u32; 8], u64>>> = std::sync::Mutex::new(None);
+
+/// Notes the call path of a copy made again after the eviction let it go ([`REMADE`]).
+#[cfg(windows)]
+fn note_remake() {
+    use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    let mut frames = [std::ptr::null_mut::<core::ffi::c_void>(); 10];
+    // SAFETY: room for 10 return addresses; this thread's own stack.
+    let n = unsafe { RtlCaptureStackBackTrace(2, frames.len() as u32, frames.as_mut_ptr(), std::ptr::null_mut()) } as usize;
+    // SAFETY: the executable's own module handle, never freed.
+    let base = unsafe { GetModuleHandleW(std::ptr::null()) } as usize;
+    let mut key = [0u32; 8];
+    for (k, &f) in key.iter_mut().zip(&frames[..n.min(8)]) {
+        let at = f as usize;
+        *k = if at >= base && at - base < 1 << 30 { (at - base) as u32 } else { 0 };
+    }
+    let mut map = REMADE.lock().unwrap_or_else(|e| e.into_inner());
+    *map.get_or_insert_with(Default::default).entry(key).or_insert(0) += 1;
+}
+
+/// For the memory minute: the `most` call paths that made evicted copies again most often, as
+/// "count: victory.exe+rva <- ..." each.
+#[cfg(windows)]
+pub(crate) fn remakes(most: usize) -> Vec<String> {
+    let map = REMADE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(map) = map.as_ref() else { return Vec::new() };
+    let mut all: Vec<(&[u32; 8], &u64)> = map.iter().collect();
+    all.sort_unstable_by(|a, b| b.1.cmp(a.1));
+    all.into_iter()
+        .take(most)
+        .map(|(key, n)| {
+            let path: Vec<String> = key.iter().map(|&rva| if rva == 0 { "-".into() } else { format!("{rva:#x}") }).collect();
+            format!("{n}: {}", path.join(" <- "))
+        })
+        .collect()
 }
 
 /// The host copy of title texture `this` if it is made, without making it
@@ -2247,6 +2308,11 @@ fn slot_evict(video: Option<[u64; 4]>, idle_ms: u64, frames: u64) {
             if idle {
                 crate::texture::unstage(at as This);
                 r.host.slot_evicted.store(crate::host::moment().max(1), Relaxed);
+                // (Neptune) Let go while no shader read it: its other slots, when the queue
+                // comes to them, are parked too (`unread_evicted`).
+                if slots[&at].iter().any(|s| s.2) {
+                    r.host.fb_evicted.store(frame + 1, Relaxed);
+                }
                 made.take()
             } else {
                 None
@@ -2758,6 +2824,7 @@ fn hand_out_resource(
             placed: std::sync::atomic::AtomicBool::new(false),
             slot_evicted: std::sync::atomic::AtomicU64::new(0),
             slot_returned: std::sync::atomic::AtomicU64::new(0),
+            fb_evicted: std::sync::atomic::AtomicU64::new(0),
         },
     });
     // The host copy waits for the texture's first use ([`Hosted`]).

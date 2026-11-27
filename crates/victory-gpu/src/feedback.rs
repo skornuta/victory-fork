@@ -48,8 +48,9 @@ pub(crate) fn idle_ms() -> u64 {
         * 1000
 }
 
-/// Since the start: copies landed, slots found read in them (summed), slots unparked.
-pub(crate) static STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Since the start: copies landed, slots found read in them (summed), slots unparked, and slots
+/// of textures let go unread that the queue came to and parked instead of making them.
+pub(crate) static STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// Per view heap slot: the frame (plus one) of the copy that last found it read; 0 never.
 static LAST_SEEN: OnceLock<Vec<AtomicU32>> = OnceLock::new();

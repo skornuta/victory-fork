@@ -1767,6 +1767,19 @@ impl HostHeap {
         self.textures.lock().unwrap_or_else(|e| e.into_inner()).park(index, key);
     }
 
+    /// (Neptune) Parks title slot `index` with the view the title's record at `handle` holds (the
+    /// key [`HostHeap::mirror`] makes of it), and takes it out of the queue's due slots: the queue
+    /// came to a slot of a texture the eviction let go unread. Whether it was a view.
+    pub(crate) fn park_at(&self, index: u32, handle: u64) -> bool {
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        if tag != VIEW_TAG || generation == 0 {
+            return false;
+        }
+        self.park(index, u64::from(generation) << 32 | u64::from(i));
+        true
+    }
+
     /// (Neptune) The key of the view host slot `index` shows now (0: none).
     pub(crate) fn made_key(&self, index: u32) -> u64 {
         self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).copied().unwrap_or(0)
